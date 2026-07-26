@@ -2,7 +2,7 @@ import type { AppConfig, ProviderConfig, ProviderName } from "../types/index.js"
 import { ConfigError } from "./errors.js";
 
 const DEFAULT_MODELS: Record<ProviderName, string> = {
-  gemini: "gemini-2.5-flash-lite",
+  gemini: "gemini-3.1-flash-lite",
   openai: "gpt-4o",
   anthropic: "claude-sonnet-4-6-20250514",
 };
@@ -81,7 +81,7 @@ export function loadConfig(): AppConfig {
     maxVideoDurationSeconds: parseInt(process.env.MAX_VIDEO_DURATION_SECONDS || "300", 10),
     logLevel: process.env.LOG_LEVEL || "info",
     gemini: {
-      escalationModel: process.env.GEMINI_ESCALATION_MODEL || "gemini-2.5-flash",
+      escalationModel: process.env.GEMINI_ESCALATION_MODEL || "gemini-3.5-flash",
       escalationEnabled: booleanEnv(process.env.GEMINI_ESCALATION_ENABLED, false),
       escalationConfidenceThreshold: parseFloat(process.env.GEMINI_ESCALATION_CONFIDENCE_THRESHOLD || "0.5"),
       escalationOnCritical: booleanEnv(process.env.GEMINI_ESCALATION_ON_CRITICAL, true),
