@@ -17,6 +17,13 @@ export interface GeminiProviderOptions {
 }
 
 type Parsed = Pick<ProviderAnalysisResult, "summary" | "timeline" | "detected_issues" | "hypotheses" | "recommended_actions">;
+type ModelAnalysis = { raw: string; parsed: Parsed; usage?: ProviderAnalysisResult["usage"]; attempts: number; repaired: boolean; reduced: boolean };
+
+class GeminiParseFailureError extends ProviderError {
+  constructor(readonly analysis: Omit<ModelAnalysis, "parsed">) {
+    super("Failed to parse Gemini response as JSON", { provider: "gemini" });
+  }
+}
 
 export class GeminiProvider implements AnalysisProvider {
   name = "gemini";
@@ -37,25 +44,25 @@ export class GeminiProvider implements AnalysisProvider {
   }
 
   async analyze(context: AnalysisContext): Promise<ProviderAnalysisResult> {
-    let first: Awaited<ReturnType<GeminiProvider["analyzeModel"]>>;
+    let first: ModelAnalysis;
     try {
       first = await this.analyzeModel(context, this.model);
     } catch (error) {
-      if (this.options.escalationEnabled && this.model !== this.options.escalationModel && error instanceof ProviderError && error.message === "Failed to parse Gemini response as JSON") {
+      if (this.options.escalationEnabled && this.model !== this.options.escalationModel && error instanceof GeminiParseFailureError) {
         const escalated = await this.analyzeModel(context, this.options.escalationModel);
-        return this.toResult(escalated, { triggered: true, from_model: this.model, to_model: this.options.escalationModel, reason: "ambiguous_response" });
+        return this.toResult(escalated, { triggered: true, from_model: this.model, to_model: this.options.escalationModel, reason: "ambiguous_response" }, error.analysis);
       }
       throw error;
     }
     const reason = this.escalationReason(first.parsed);
     if (this.options.escalationEnabled && reason && this.model !== this.options.escalationModel) {
       const escalated = await this.analyzeModel(context, this.options.escalationModel);
-      return this.toResult(escalated, { triggered: true, from_model: this.model, to_model: this.options.escalationModel, reason });
+      return this.toResult(escalated, { triggered: true, from_model: this.model, to_model: this.options.escalationModel, reason }, first);
     }
     return this.toResult(first, { triggered: false });
   }
 
-  private async analyzeModel(context: AnalysisContext, model: string): Promise<{ raw: string; parsed: Parsed; usage?: ProviderAnalysisResult["usage"]; attempts: number; repaired: boolean; reduced: boolean }> {
+  private async analyzeModel(context: AnalysisContext, model: string): Promise<ModelAnalysis> {
     const systemPrompt = buildSystemPrompt();
     let frames = context.keyframes;
     let repaired = false;
@@ -67,10 +74,19 @@ export class GeminiProvider implements AnalysisProvider {
       try {
         const result = await this.callWithTimeout(model, systemPrompt, parts, attempt);
         const raw = result.response.text();
-        const parsedResult = this.parseResponse(raw);
+        const usageMetadata = result.response.usageMetadata;
+        const usage = usageMetadata ? { input_tokens: usageMetadata.promptTokenCount ?? 0, output_tokens: usageMetadata.candidatesTokenCount ?? 0 } : undefined;
+        let parsedResult: { parsed: Parsed; repaired: boolean };
+        try {
+          parsedResult = this.parseResponse(raw);
+        } catch (error) {
+          if (error instanceof ProviderError && error.message === "Failed to parse Gemini response as JSON") {
+            throw new GeminiParseFailureError({ raw, usage, attempts: attempt, repaired, reduced });
+          }
+          throw error;
+        }
         repaired ||= parsedResult.repaired;
-        const usage = result.response.usageMetadata;
-        return { raw, parsed: parsedResult.parsed, usage: usage ? { input_tokens: usage.promptTokenCount ?? 0, output_tokens: usage.candidatesTokenCount ?? 0 } : undefined, attempts: attempt, repaired, reduced };
+        return { raw, parsed: parsedResult.parsed, usage, attempts: attempt, repaired, reduced };
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
         const parseFailure = lastError instanceof ProviderError && lastError.message === "Failed to parse Gemini response as JSON";
@@ -98,9 +114,10 @@ export class GeminiProvider implements AnalysisProvider {
 
   private parseResponse(raw: string): { parsed: Parsed; repaired: boolean } {
     let parsed: Record<string, unknown> | null;
-    try { parsed = JSON.parse(raw) as Record<string, unknown>; } catch { parsed = repairJson(raw); }
+    let repaired = false;
+    try { parsed = JSON.parse(raw) as Record<string, unknown>; } catch { parsed = repairJson(raw); repaired = true; }
     if (!parsed) throw new ProviderError("Failed to parse Gemini response as JSON", { provider: this.name });
-    return { repaired: raw.trim() !== JSON.stringify(parsed), parsed: {
+    return { repaired, parsed: {
       summary: typeof parsed.summary === "string" && parsed.summary ? parsed.summary : "Analysis completed but no summary was provided.",
       timeline: Array.isArray(parsed.timeline) ? parsed.timeline as ProviderAnalysisResult["timeline"] : [],
       detected_issues: Array.isArray(parsed.detected_issues) ? parsed.detected_issues as ProviderAnalysisResult["detected_issues"] : [],
@@ -123,7 +140,12 @@ export class GeminiProvider implements AnalysisProvider {
     return /network|fetch|socket|econn|rate.?limit|timeout/i.test(error.message);
   }
 
-  private toResult(result: Awaited<ReturnType<GeminiProvider["analyzeModel"]>>, escalation: { triggered: boolean; from_model?: string; to_model?: string; reason?: string }): ProviderAnalysisResult {
-    return { raw: result.raw, ...result.parsed, usage: result.usage, meta: { retries: { attempts: result.attempts, json_repaired: result.repaired, frames_reduced: result.reduced }, escalation } };
+  private toResult(result: ModelAnalysis, escalation: { triggered: boolean; from_model?: string; to_model?: string; reason?: string }, first?: Omit<ModelAnalysis, "parsed"> | ModelAnalysis): ProviderAnalysisResult {
+    const retries = first ? {
+      attempts: first.attempts + result.attempts,
+      json_repaired: first.repaired || result.repaired,
+      frames_reduced: first.reduced || result.reduced,
+    } : { attempts: result.attempts, json_repaired: result.repaired, frames_reduced: result.reduced };
+    return { raw: result.raw, ...result.parsed, usage: result.usage, meta: { retries, escalation: first ? { ...escalation, from_usage: first.usage } : escalation } };
   }
 }

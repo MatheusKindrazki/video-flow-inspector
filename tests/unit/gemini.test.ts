@@ -4,7 +4,7 @@ import { GeminiProvider } from "../../src/analysis/gemini.js";
 const valid = (hypotheses: unknown[] = []) => JSON.stringify({ summary: "ok", timeline: [], detected_issues: [], hypotheses, recommended_actions: [] });
 const context = { goal: "check flow", keyframes: [], video_duration_ms: 1_000 };
 
-function clientWith(responses: Array<string | Error>) {
+function clientWith(responses: Array<string | Error | { raw: string; input: number; output: number }>) {
   const models: string[] = [];
   return {
     models,
@@ -13,7 +13,8 @@ function clientWith(responses: Array<string | Error>) {
         models.push(model);
         const response = responses.shift();
         if (response instanceof Error) throw response;
-        return { response: { text: () => response, usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 } } };
+        const content = typeof response === "string" ? { raw: response, input: 10, output: 5 } : response;
+        return { response: { text: () => content.raw, usageMetadata: { promptTokenCount: content.input, candidatesTokenCount: content.output } } };
       },
     }),
   };
@@ -43,6 +44,12 @@ describe("GeminiProvider", () => {
     expect(result.meta?.retries.json_repaired).toBe(true);
   });
 
+  it("does not mark valid pretty-printed JSON as repaired", async () => {
+    const client = clientWith(['{\n  "summary": "ok",\n  "timeline": [],\n  "detected_issues": [],\n  "hypotheses": [],\n  "recommended_actions": []\n}']);
+    const result = await new GeminiProvider("unused", "gemini-2.5-flash-lite", 1, 100, { client, retryDelayMs: 0 }).analyze(context);
+    expect(result.meta?.retries.json_repaired).toBe(false);
+  });
+
   it("retries once when JSON cannot be repaired", async () => {
     const client = clientWith(["not JSON", valid()]);
     const result = await new GeminiProvider("unused", "gemini-2.5-flash-lite", 2, 100, { client, retryDelayMs: 0 }).analyze(context);
@@ -57,11 +64,22 @@ describe("GeminiProvider", () => {
     expect(result.meta?.escalation.triggered).toBe(true);
   });
 
+  it("preserves first-model usage and combines retry stats when escalating", async () => {
+    const transient = Object.assign(new Error("server error"), { status: 503 });
+    const client = clientWith([transient, { raw: valid([{ confidence: 0.2 }]), input: 100, output: 20 }, { raw: valid([{ confidence: 0.9 }]), input: 200, output: 30 }]);
+    const result = await new GeminiProvider("unused", "gemini-2.5-flash-lite", 2, 100, { client, escalationEnabled: true, escalationConfidenceThreshold: 0.5, retryDelayMs: 0 }).analyze(context);
+    expect(result.usage).toEqual({ input_tokens: 200, output_tokens: 30 });
+    expect(result.meta?.escalation.from_usage).toEqual({ input_tokens: 100, output_tokens: 20 });
+    expect(result.meta?.retries).toEqual({ attempts: 3, json_repaired: false, frames_reduced: false });
+  });
+
   it("escalates when the Lite response remains ambiguous after repair", async () => {
     const client = clientWith(["not JSON", valid()]);
     const result = await new GeminiProvider("unused", "gemini-2.5-flash-lite", 1, 100, { client, escalationEnabled: true, retryDelayMs: 0 }).analyze(context);
     expect(client.models).toEqual(["gemini-2.5-flash-lite", "gemini-2.5-flash"]);
     expect(result.meta?.escalation.reason).toBe("ambiguous_response");
+    expect(result.meta?.escalation.from_usage).toEqual({ input_tokens: 10, output_tokens: 5 });
+    expect(result.meta?.retries.attempts).toBe(2);
   });
 
   it("does not escalate when disabled", async () => {

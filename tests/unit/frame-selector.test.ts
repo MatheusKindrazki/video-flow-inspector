@@ -24,6 +24,11 @@ describe("selectKeyframes", () => {
     expect(result.selected.map((frame) => frame.index)).toEqual([0, 1, 4]);
   });
 
+  it("respects a cap of one by retaining only the first anchor", () => {
+    const result = selectKeyframes(frames([0, 0.9, 0]), { ...options, maxFrames: 1 });
+    expect(result.selected.map((frame) => frame.index)).toEqual([0]);
+  });
+
   it("deduplicates descriptors with duplicate indexes", () => {
     const result = selectKeyframes([{ index: 0, timestamp_ms: 0, changeScore: 0 }, { index: 1, timestamp_ms: 1_000, changeScore: 0.9 }, { index: 1, timestamp_ms: 1_100, changeScore: 0.9 }, { index: 2, timestamp_ms: 2_000, changeScore: 0 }], options);
     expect(result.selected.map((frame) => frame.index)).toEqual([0, 1, 2]);

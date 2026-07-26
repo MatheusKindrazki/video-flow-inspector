@@ -12,7 +12,7 @@ import {
   computeKeyframeChangeScores,
 } from "../preprocessing/keyframe-extractor.js";
 import { selectKeyframes, type FrameSelectionOptions } from "../preprocessing/frame-selector.js";
-import { calculateCost } from "../analysis/pricing.js";
+import { calculateCost, type CostBreakdown, type TokenUsage } from "../analysis/pricing.js";
 import { GeminiProvider } from "../analysis/gemini.js";
 import { OpenAIProvider } from "../analysis/openai.js";
 import { AnalysisProvider, AnalysisContext } from "../analysis/provider.js";
@@ -97,7 +97,7 @@ interface PipelineOutput {
     frames?: { candidates: number; analyzed: number; discarded: number; selection_strategy: string };
     usage?: { input_tokens: number; output_tokens: number };
     cost?: { input_cost_usd: number; output_cost_usd: number; total_cost_usd: number; pricing_source: "confirmed" | "heuristic" };
-    escalation?: { triggered: boolean; from_model?: string; to_model?: string; reason?: string };
+    escalation?: { triggered: boolean; from_model?: string; to_model?: string; reason?: string; from_usage?: TokenUsage };
     retries?: { attempts: number; json_repaired: boolean; frames_reduced: boolean };
   };
   raw_provider_notes?: string;
@@ -315,7 +315,7 @@ export async function analyzeVideoFlow(
 
     // ── Step 11: Assemble final output ────────────────────────────────
     const analysisDurationMs = Date.now() - startTime;
-    const cost = calculateCost(providerResult.model, providerResult.result.usage);
+    const { cost, usage } = calculateResultCost(providerResult.model, providerResult.result);
 
     const output: PipelineOutput = {
       summary: normalized.summary,
@@ -332,7 +332,7 @@ export async function analyzeVideoFlow(
         keyframes_analyzed: keyframesWithBase64.length,
         analysis_duration_ms: analysisDurationMs,
         frames: { candidates: keyframes.length, analyzed: keyframesWithBase64.length, discarded: discardedKeyframes.length, selection_strategy: selection.strategy },
-        usage: providerResult.result.usage ?? { input_tokens: cost.input_tokens, output_tokens: cost.output_tokens },
+        usage,
         cost,
         escalation: providerResult.result.meta?.escalation ?? { triggered: false },
         retries: providerResult.result.meta?.retries ?? { attempts: 1, json_repaired: false, frames_reduced: false },
@@ -412,8 +412,28 @@ interface ProviderRunResult {
     };
     meta?: {
       retries: { attempts: number; json_repaired: boolean; frames_reduced: boolean };
-      escalation: { triggered: boolean; from_model?: string; to_model?: string; reason?: string };
+      escalation: { triggered: boolean; from_model?: string; to_model?: string; reason?: string; from_usage?: TokenUsage };
     };
+  };
+}
+
+export function calculateResultCost(model: string, result: Pick<ProviderRunResult["result"], "usage" | "meta">): { cost: CostBreakdown; usage?: TokenUsage } {
+  const escalated = result.meta?.escalation;
+  const currentCost = calculateCost(model, result.usage);
+  if (!escalated?.triggered || !escalated.from_model || !escalated.from_usage) return { cost: currentCost, usage: result.usage };
+
+  const firstCost = calculateCost(escalated.from_model, escalated.from_usage);
+  const round = (value: number) => Math.round(value * 1_000_000_000) / 1_000_000_000;
+  return {
+    usage: result.usage,
+    cost: {
+      input_tokens: firstCost.input_tokens + currentCost.input_tokens,
+      output_tokens: firstCost.output_tokens + currentCost.output_tokens,
+      input_cost_usd: round(firstCost.input_cost_usd + currentCost.input_cost_usd),
+      output_cost_usd: round(firstCost.output_cost_usd + currentCost.output_cost_usd),
+      total_cost_usd: round(firstCost.total_cost_usd + currentCost.total_cost_usd),
+      pricing_source: firstCost.pricing_source === "confirmed" && currentCost.pricing_source === "confirmed" ? "confirmed" : "heuristic",
+    },
   };
 }
 

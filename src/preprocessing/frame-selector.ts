@@ -49,7 +49,7 @@ export function selectKeyframes(frames: FrameDescriptor[], options: FrameSelecti
     add(available[rank], "safety");
   }
 
-  const anchors = new Set([unique[0]?.index, unique.at(-1)?.index]);
+  const anchors = new Set(options.maxFrames >= 2 ? [unique[0]?.index, unique.at(-1)?.index] : [unique[0]?.index]);
   while (selected.size > options.maxFrames) {
     const removable = unique.filter((frame) => selected.has(frame.index) && !anchors.has(frame.index))
       .sort((a, b) => a.changeScore - b.changeScore || b.index - a.index);
