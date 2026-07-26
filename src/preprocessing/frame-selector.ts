@@ -33,7 +33,7 @@ export function selectKeyframes(frames: FrameDescriptor[], options: FrameSelecti
   let lastSelectedTimestamp = unique[0]?.timestamp_ms;
   for (const frame of unique) {
     if (frame.index === unique[0]?.index) continue;
-    if (lastSelectedTimestamp !== undefined && frame.timestamp_ms - lastSelectedTimestamp > options.safetyIntervalMs) {
+    if (lastSelectedTimestamp !== undefined && frame.timestamp_ms - lastSelectedTimestamp >= options.safetyIntervalMs) {
       add(frame, "safety");
       lastSelectedTimestamp = frame.timestamp_ms;
     } else if (selected.has(frame.index)) {

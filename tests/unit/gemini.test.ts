@@ -87,4 +87,18 @@ describe("GeminiProvider", () => {
     await new GeminiProvider("unused", "gemini-2.5-flash-lite", 1, 100, { client, escalationEnabled: false, retryDelayMs: 0 }).analyze(context);
     expect(client.models).toEqual(["gemini-2.5-flash-lite"]);
   });
+
+  it("falls back to the primary result when the escalation call fails", async () => {
+    // Primary succeeds but triggers escalation (low confidence); the escalation
+    // model then fails. The valid primary result must be returned rather than
+    // throwing, with honest metadata that escalation was attempted and failed.
+    const escalationError = Object.assign(new Error("server error"), { status: 503 });
+    const client = clientWith([valid([{ confidence: 0.2 }]), escalationError]);
+    const result = await new GeminiProvider("unused", "gemini-2.5-flash-lite", 1, 100, { client, escalationEnabled: true, escalationConfidenceThreshold: 0.5, retryDelayMs: 0 }).analyze(context);
+    expect(client.models).toEqual(["gemini-2.5-flash-lite", "gemini-2.5-flash"]);
+    expect(result.meta?.escalation.triggered).toBe(false);
+    expect(result.meta?.escalation.reason).toBe("escalation_failed:low_confidence");
+    // Primary usage is preserved on the returned result.
+    expect(result.usage).toEqual({ input_tokens: 10, output_tokens: 5 });
+  });
 });

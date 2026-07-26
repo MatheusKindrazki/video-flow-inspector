@@ -52,17 +52,40 @@ const DEFAULT_WIDTH = 800;
 const FRAME_PATTERN = /^frame_(\d{4})\.jpg$/;
 
 /**
+ * Compute the effective sampling interval and frame count so candidates are
+ * distributed uniformly across the ENTIRE video duration rather than only the
+ * first `maxFrames` seconds.
+ *
+ * When the requested `intervalSeconds` would yield more frames than `maxFrames`,
+ * the interval is widened so the cap still covers from the start to (near) the
+ * end of the video. This guarantees a candidate close to the end before the
+ * adaptive selection runs.
+ *
+ * @returns `effectiveInterval` (seconds) and `framesToExtract` (cap).
+ */
+export function computeFramePlan(durationSeconds: number, intervalSeconds: number, maxFrames: number): { effectiveInterval: number; framesToExtract: number } {
+  const safeMaxFrames = Math.max(1, maxFrames);
+  // Widened interval: cover the full duration with at most maxFrames candidates.
+  // Use (maxFrames - 1) segments between samples so both endpoints are covered.
+  const intervalFromBudget = durationSeconds / Math.max(1, safeMaxFrames - 1);
+  const effectiveInterval = Math.max(intervalSeconds, intervalFromBudget);
+  const estimatedFrames = Math.max(1, Math.floor(durationSeconds / effectiveInterval) + 1);
+  const framesToExtract = Math.min(estimatedFrames, safeMaxFrames);
+  return { effectiveInterval, framesToExtract };
+}
+
+/**
  * Extract keyframes from a video file using ffmpeg.
  *
  * Strategy:
- * 1. Calculate total frames needed based on video duration and interval.
- * 2. Cap at maxFrames.
- * 3. Run ffmpeg with fps and scale filters to extract JPEG frames.
- * 4. Read extracted file names, compute timestamps, and build Keyframe objects.
+ * 1. Compute a uniform sampling plan across the full duration (see
+ *    {@link computeFramePlan}) so long videos are not only sampled at the start.
+ * 2. Run ffmpeg with fps and scale filters to extract JPEG frames.
+ * 3. Read extracted file names, compute timestamps, and build Keyframe objects.
  *
  * Command:
  *   ffmpeg -i <input> -vf "fps=1/<interval>,scale=<width>:-1" \
- *     -frames:v <max> -q:v 2 <outputDir>/frame_%04d.jpg
+ *     -frames:v <cap> -q:v 2 <outputDir>/frame_%04d.jpg
  *
  * @throws {KeyframeExtractionError} if ffmpeg is missing, the command fails,
  *   or no frames are produced.
@@ -74,22 +97,23 @@ export async function extractKeyframes(
 ): Promise<Keyframe[]> {
   const { intervalSeconds, maxFrames, outputDir, width = DEFAULT_WIDTH } = options;
 
-  // Calculate how many frames we expect.
+  // Calculate how many frames we expect, distributing candidates uniformly
+  // across the full duration so a long video is not only sampled at its start.
   const durationSeconds = durationMs / 1000;
-  const estimatedFrames = Math.max(1, Math.floor(durationSeconds / intervalSeconds) + 1);
-  const framesToExtract = Math.min(estimatedFrames, maxFrames);
+  const { effectiveInterval, framesToExtract } = computeFramePlan(durationSeconds, intervalSeconds, maxFrames);
 
   logger.info("Starting keyframe extraction", {
     videoPath,
     durationMs,
     intervalSeconds,
-    estimatedFrames,
+    effectiveInterval,
     framesToExtract,
     outputDir,
   });
 
-  // Build the ffmpeg video-filter string.
-  const vf = `fps=1/${intervalSeconds},scale=${width}:-1`;
+  // Build the ffmpeg video-filter string. Using the effective interval spreads
+  // samples across the whole timeline; -frames:v is only a safety cap.
+  const vf = `fps=1/${effectiveInterval},scale=${width}:-1`;
   const outputPattern = join(outputDir, "frame_%04d.jpg");
 
   try {
@@ -141,9 +165,9 @@ export async function extractKeyframes(
   logger.info("Keyframes extracted", { count: frameFiles.length });
 
   // Build Keyframe objects. ffmpeg numbers frames starting at 1, and each
-  // successive frame is intervalSeconds later in the video.
+  // successive frame is effectiveInterval later in the video.
   const keyframes: Keyframe[] = frameFiles.map((file, idx) => {
-    const timestampMs = Math.min(idx * intervalSeconds * 1000, durationMs);
+    const timestampMs = Math.min(idx * effectiveInterval * 1000, durationMs);
 
     return {
       index: idx,

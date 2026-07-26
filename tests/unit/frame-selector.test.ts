@@ -14,9 +14,11 @@ describe("selectKeyframes", () => {
     expect(selectKeyframes(frames([0, 0.5, 0.49, 0]), options).selected.map((frame) => frame.index)).toContain(1);
   });
 
-  it("adds safety samples across long gaps", () => {
+  it("adds safety samples across long gaps at inclusive interval boundary", () => {
+    // safetyIntervalMs is inclusive (>=): with 3000ms and 1000ms steps, a gap of
+    // exactly 3000ms qualifies, so samples land at 0, 3, 6 and the last anchor 9.
     const result = selectKeyframes(frames([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 1_000), options);
-    expect(result.selected.map((frame) => frame.index)).toEqual([0, 4, 8, 9]);
+    expect(result.selected.map((frame) => frame.index)).toEqual([0, 3, 6, 9]);
   });
 
   it("respects the cap without dropping anchors", () => {

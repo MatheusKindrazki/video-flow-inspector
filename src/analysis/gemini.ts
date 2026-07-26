@@ -19,7 +19,7 @@ export interface GeminiProviderOptions {
 type Parsed = Pick<ProviderAnalysisResult, "summary" | "timeline" | "detected_issues" | "hypotheses" | "recommended_actions">;
 type ModelAnalysis = { raw: string; parsed: Parsed; usage?: ProviderAnalysisResult["usage"]; attempts: number; repaired: boolean; reduced: boolean };
 
-class GeminiParseFailureError extends ProviderError {
+export class GeminiParseFailureError extends ProviderError {
   constructor(readonly analysis: Omit<ModelAnalysis, "parsed">) {
     super("Failed to parse Gemini response as JSON", { provider: "gemini" });
   }
@@ -56,8 +56,17 @@ export class GeminiProvider implements AnalysisProvider {
     }
     const reason = this.escalationReason(first.parsed);
     if (this.options.escalationEnabled && reason && this.model !== this.options.escalationModel) {
-      const escalated = await this.analyzeModel(context, this.options.escalationModel);
-      return this.toResult(escalated, { triggered: true, from_model: this.model, to_model: this.options.escalationModel, reason }, first);
+      // Escalation is an optional optimization on top of a valid primary result.
+      // If the escalation model call fails, fall back to the primary analysis
+      // rather than discarding it, while honestly recording that escalation was
+      // attempted and failed (no error/cost is hidden — from_usage is omitted
+      // because the escalation produced no usable result).
+      try {
+        const escalated = await this.analyzeModel(context, this.options.escalationModel);
+        return this.toResult(escalated, { triggered: true, from_model: this.model, to_model: this.options.escalationModel, reason }, first);
+      } catch {
+        return this.toResult(first, { triggered: false, reason: `escalation_failed:${reason}` });
+      }
     }
     return this.toResult(first, { triggered: false });
   }
@@ -80,7 +89,7 @@ export class GeminiProvider implements AnalysisProvider {
         try {
           parsedResult = this.parseResponse(raw);
         } catch (error) {
-          if (error instanceof ProviderError && error.message === "Failed to parse Gemini response as JSON") {
+          if (error instanceof ProviderError) {
             throw new GeminiParseFailureError({ raw, usage, attempts: attempt, repaired, reduced });
           }
           throw error;
@@ -89,7 +98,7 @@ export class GeminiProvider implements AnalysisProvider {
         return { raw, parsed: parsedResult.parsed, usage, attempts: attempt, repaired, reduced };
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
-        const parseFailure = lastError instanceof ProviderError && lastError.message === "Failed to parse Gemini response as JSON";
+        const parseFailure = lastError instanceof GeminiParseFailureError;
         if (!(this.isTransient(lastError) || parseFailure) || attempt === this.maxRetries) throw lastError;
         if (lastError instanceof ProviderTimeoutError && this.options.timeoutReduceFrames && frames.length > 2) {
           frames = frames.filter((_, index) => index === 0 || index === frames.length - 1 || index % 2 === 0);

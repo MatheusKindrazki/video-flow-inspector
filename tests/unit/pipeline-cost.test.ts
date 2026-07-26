@@ -20,4 +20,24 @@ describe("calculateResultCost", () => {
     expect(result.usage).toBeUndefined();
     expect(result.cost).toMatchObject({ input_tokens: 4_000, output_tokens: 1_000, pricing_source: "heuristic" });
   });
+
+  it("aggregates initial and final token usage when escalation succeeds", () => {
+    // Cost already combines both models; usage must too, so reported tokens stay
+    // coherent with the combined cost rather than only reflecting the final call.
+    const result = calculateResultCost("gemini-2.5-flash", {
+      usage: { input_tokens: 200, output_tokens: 30 },
+      meta: { escalation: { triggered: true, from_model: "gemini-2.5-flash-lite", to_model: "gemini-2.5-flash", from_usage: { input_tokens: 100, output_tokens: 20 } } },
+    });
+    expect(result.usage).toEqual({ input_tokens: 300, output_tokens: 50 });
+  });
+
+  it("omits usage when the escalation final usage is absent", () => {
+    // If the final usage is missing, do not invent tokens — cost still sums but
+    // usage is undefined rather than exposing heuristic counts as observed.
+    const result = calculateResultCost("gemini-2.5-flash", {
+      meta: { escalation: { triggered: true, from_model: "gemini-2.5-flash-lite", to_model: "gemini-2.5-flash", from_usage: { input_tokens: 100, output_tokens: 20 } } },
+    });
+    expect(result.usage).toBeUndefined();
+    expect(result.cost).toBeDefined();
+  });
 });

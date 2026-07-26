@@ -425,7 +425,13 @@ export function calculateResultCost(model: string, result: Pick<ProviderRunResul
   const firstCost = calculateCost(escalated.from_model, escalated.from_usage);
   const round = (value: number) => Math.round(value * 1_000_000_000) / 1_000_000_000;
   return {
-    usage: result.usage,
+    // Aggregate initial + final token usage so it stays coherent with the
+    // combined cost. Only return summed usage when the final (escalation) usage
+    // is actually present; otherwise omit usage rather than inventing tokens.
+    usage: result.usage ? {
+      input_tokens: escalated.from_usage.input_tokens + result.usage.input_tokens,
+      output_tokens: escalated.from_usage.output_tokens + result.usage.output_tokens,
+    } : undefined,
     cost: {
       input_tokens: firstCost.input_tokens + currentCost.input_tokens,
       output_tokens: firstCost.output_tokens + currentCost.output_tokens,
