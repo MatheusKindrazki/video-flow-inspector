@@ -30,10 +30,10 @@ export class GeminiProvider implements AnalysisProvider {
   private client: GeminiClient;
   private options: Required<Omit<GeminiProviderOptions, "client">>;
 
-  constructor(private apiKey: string, private model = "gemini-2.5-flash-lite", private maxRetries = 3, private timeoutMs = 120000, options: GeminiProviderOptions = {}) {
+  constructor(private apiKey: string, private model = "gemini-3.1-flash-lite", private maxRetries = 3, private timeoutMs = 120000, options: GeminiProviderOptions = {}) {
     this.client = options.client ?? (new GoogleGenerativeAI(apiKey) as unknown as GeminiClient);
     this.options = {
-      escalationModel: options.escalationModel ?? "gemini-2.5-flash",
+      escalationModel: options.escalationModel ?? "gemini-3.5-flash",
       escalationEnabled: options.escalationEnabled ?? false,
       escalationConfidenceThreshold: options.escalationConfidenceThreshold ?? 0.5,
       escalationOnCritical: options.escalationOnCritical ?? true,

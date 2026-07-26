@@ -4,8 +4,8 @@
  * use the heuristic path until they are verified.
  */
 const CONFIRMED_PRICING: Record<string, { inputPerMillion: number; outputPerMillion: number }> = {
-  "gemini-2.5-flash": { inputPerMillion: 0.3, outputPerMillion: 2.5 },
-  "gemini-2.5-flash-lite": { inputPerMillion: 0.1, outputPerMillion: 0.4 },
+  "gemini-3.1-flash-lite": { inputPerMillion: 0.25, outputPerMillion: 1.5 },
+  "gemini-3.5-flash": { inputPerMillion: 1.5, outputPerMillion: 9 },
 };
 
 export interface TokenUsage {

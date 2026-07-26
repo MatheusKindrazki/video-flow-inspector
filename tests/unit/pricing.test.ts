@@ -3,25 +3,25 @@ import { calculateCost } from "../../src/analysis/pricing.js";
 
 describe("calculateCost", () => {
   it("calculates confirmed Gemini Flash pricing from real usage", () => {
-    expect(calculateCost("gemini-2.5-flash", { input_tokens: 1_000_000, output_tokens: 1_000_000 })).toMatchObject({
-      input_cost_usd: 0.3,
-      output_cost_usd: 2.5,
-      total_cost_usd: 2.8,
+    expect(calculateCost("gemini-3.5-flash", { input_tokens: 1_000_000, output_tokens: 1_000_000 })).toMatchObject({
+      input_cost_usd: 1.5,
+      output_cost_usd: 9,
+      total_cost_usd: 10.5,
       pricing_source: "confirmed",
     });
   });
 
   it("calculates confirmed Gemini Flash-Lite pricing from real usage", () => {
-    expect(calculateCost("gemini-2.5-flash-lite", { input_tokens: 1_000_000, output_tokens: 1_000_000 })).toMatchObject({
-      input_cost_usd: 0.1,
-      output_cost_usd: 0.4,
-      total_cost_usd: 0.5,
+    expect(calculateCost("gemini-3.1-flash-lite", { input_tokens: 1_000_000, output_tokens: 1_000_000 })).toMatchObject({
+      input_cost_usd: 0.25,
+      output_cost_usd: 1.5,
+      total_cost_usd: 1.75,
       pricing_source: "confirmed",
     });
   });
 
   it("uses a labelled heuristic when usage is unavailable", () => {
-    const cost = calculateCost("gemini-2.5-flash-lite");
+    const cost = calculateCost("gemini-3.1-flash-lite");
     expect(cost.pricing_source).toBe("heuristic");
     expect(cost.total_cost_usd).toBeGreaterThan(0);
   });
