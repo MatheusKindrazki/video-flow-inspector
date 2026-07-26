@@ -9,7 +9,10 @@ import {
 import {
   extractKeyframes,
   loadKeyframesAsBase64,
+  computeKeyframeChangeScores,
 } from "../preprocessing/keyframe-extractor.js";
+import { selectKeyframes, type FrameSelectionOptions } from "../preprocessing/frame-selector.js";
+import { calculateCost } from "../analysis/pricing.js";
 import { GeminiProvider } from "../analysis/gemini.js";
 import { OpenAIProvider } from "../analysis/openai.js";
 import { AnalysisProvider, AnalysisContext } from "../analysis/provider.js";
@@ -17,6 +20,11 @@ import { normalizeProviderOutput } from "../normalizer/semantic.js";
 import { generateRecommendation } from "../recommender/actions.js";
 import { VideoFlowError, ProviderError } from "../utils/errors.js";
 import type { AppConfig, ProviderName } from "../types/index.js";
+import type { Keyframe } from "../analysis/provider.js";
+
+export function selectFramesForAnalysis(keyframes: Keyframe[], options: FrameSelectionOptions, changeScores: number[]) {
+  return selectKeyframes(keyframes.map((keyframe, index) => ({ index: keyframe.index, timestamp_ms: keyframe.timestamp_ms, changeScore: changeScores[index] ?? 0 })), options);
+}
 
 // ─── Input Type ────────────────────────────────────────────────────────────
 
@@ -86,6 +94,11 @@ interface PipelineOutput {
     keyframes_analyzed: number;
     analysis_duration_ms: number;
     cost_estimate_usd?: number;
+    frames?: { candidates: number; analyzed: number; discarded: number; selection_strategy: string };
+    usage?: { input_tokens: number; output_tokens: number };
+    cost?: { input_cost_usd: number; output_cost_usd: number; total_cost_usd: number; pricing_source: "confirmed" | "heuristic" };
+    escalation?: { triggered: boolean; from_model?: string; to_model?: string; reason?: string };
+    retries?: { attempts: number; json_repaired: boolean; frames_reduced: boolean };
   };
   raw_provider_notes?: string;
 }
@@ -116,6 +129,14 @@ function createProvider(
         providerConfig.model,
         providerConfig.maxRetries,
         providerConfig.timeoutMs,
+        {
+          escalationModel: config.gemini.escalationModel,
+          escalationEnabled: config.gemini.escalationEnabled,
+          escalationConfidenceThreshold: config.gemini.escalationConfidenceThreshold,
+          escalationOnCritical: config.gemini.escalationOnCritical,
+          maxOutputTokens: config.gemini.maxOutputTokens,
+          timeoutReduceFrames: config.gemini.timeoutReduceFrames,
+        },
       );
 
     case "openai":
@@ -137,29 +158,6 @@ function createProvider(
       logger.warn(`Unknown provider: "${name}"`, { provider: name });
       return null;
   }
-}
-
-// ─── Cost Estimator ────────────────────────────────────────────────────────
-
-/**
- * Rough cost estimate based on provider and keyframe count.
- * These are approximate values based on typical image + text token costs.
- */
-function estimateCost(
-  providerName: string,
-  keyframeCount: number,
-): number {
-  // Approximate cost per keyframe (image tokens + text response)
-  const costPerKeyframe: Record<string, number> = {
-    gemini: 0.001,   // ~$0.001 per keyframe for Gemini Flash
-    openai: 0.005,   // ~$0.005 per keyframe for GPT-4o (images are more expensive)
-    anthropic: 0.003, // ~$0.003 per keyframe for Claude
-  };
-
-  const baseCost = 0.002; // Base cost for system prompt + text output
-  const perFrame = costPerKeyframe[providerName] ?? 0.003;
-
-  return Math.round((baseCost + perFrame * keyframeCount) * 10000) / 10000;
 }
 
 // ─── Main Pipeline ─────────────────────────────────────────────────────────
@@ -259,16 +257,29 @@ export async function analyzeVideoFlow(
       videoSource.filePath,
       metadata.duration_ms,
       {
-        intervalSeconds: config.keyframeIntervalSeconds,
-        maxFrames: config.maxKeyframes,
+        intervalSeconds: Math.max(0.5, config.keyframeIntervalSeconds / 2),
+        maxFrames: config.maxKeyframes * 2,
         outputDir: keyframeOutputDir,
       },
     );
 
-    logger.info("Keyframes extracted", { count: keyframes.length });
+    const changeScores = await computeKeyframeChangeScores(keyframes);
+    const selection = selectFramesForAnalysis(keyframes, {
+      maxFrames: config.maxKeyframes,
+      changeThreshold: config.frameSelection.changeThreshold,
+      safetyIntervalMs: config.frameSelection.safetyIntervalMs,
+      minFrames: 2,
+    }, changeScores);
+    const selectedIndexes = new Set(selection.selected.map((frame) => frame.index));
+    const selectedKeyframes = keyframes.filter((frame) => selectedIndexes.has(frame.index));
+    const discardedKeyframes = keyframes.filter((frame) => !selectedIndexes.has(frame.index));
+    const { unlink } = await import("node:fs/promises");
+    await Promise.all(discardedKeyframes.map(async (frame) => unlink(frame.path).catch(() => undefined)));
+
+    logger.info("Keyframes adaptively selected", { candidates: keyframes.length, selected: selectedKeyframes.length, discarded: discardedKeyframes.length, strategy: selection.strategy });
 
     // ── Step 7: Load keyframes as base64 ──────────────────────────────
-    const keyframesWithBase64 = await loadKeyframesAsBase64(keyframes);
+    const keyframesWithBase64 = await loadKeyframesAsBase64(selectedKeyframes);
 
     logger.info("Keyframes loaded as base64", {
       count: keyframesWithBase64.length,
@@ -304,10 +315,7 @@ export async function analyzeVideoFlow(
 
     // ── Step 11: Assemble final output ────────────────────────────────
     const analysisDurationMs = Date.now() - startTime;
-    const costEstimate = estimateCost(
-      providerResult.providerName,
-      keyframesWithBase64.length,
-    );
+    const cost = calculateCost(providerResult.model, providerResult.result.usage);
 
     const output: PipelineOutput = {
       summary: normalized.summary,
@@ -323,7 +331,12 @@ export async function analyzeVideoFlow(
         video_duration_ms: metadata.duration_ms,
         keyframes_analyzed: keyframesWithBase64.length,
         analysis_duration_ms: analysisDurationMs,
-        cost_estimate_usd: costEstimate,
+        frames: { candidates: keyframes.length, analyzed: keyframesWithBase64.length, discarded: discardedKeyframes.length, selection_strategy: selection.strategy },
+        usage: providerResult.result.usage ?? { input_tokens: cost.input_tokens, output_tokens: cost.output_tokens },
+        cost,
+        escalation: providerResult.result.meta?.escalation ?? { triggered: false },
+        retries: providerResult.result.meta?.retries ?? { attempts: 1, json_repaired: false, frames_reduced: false },
+        cost_estimate_usd: cost.total_cost_usd,
       },
       raw_provider_notes: providerResult.result.raw,
     };
@@ -397,6 +410,10 @@ interface ProviderRunResult {
       input_tokens: number;
       output_tokens: number;
     };
+    meta?: {
+      retries: { attempts: number; json_repaired: boolean; frames_reduced: boolean };
+      escalation: { triggered: boolean; from_model?: string; to_model?: string; reason?: string };
+    };
   };
 }
 
@@ -423,7 +440,7 @@ async function runAnalysisWithFallback(
 
       return {
         providerName: config.defaultProvider,
-        model: primaryConfig.model,
+        model: result.meta?.escalation.to_model ?? primaryConfig.model,
         result,
       };
     } catch (error) {
@@ -459,7 +476,7 @@ async function runAnalysisWithFallback(
 
         return {
           providerName: config.fallbackProvider,
-          model: fallbackConfig.model,
+          model: result.meta?.escalation.to_model ?? fallbackConfig.model,
           result,
         };
       } catch (error) {

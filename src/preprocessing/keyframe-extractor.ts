@@ -23,6 +23,31 @@ interface ExtractionOptions {
   width?: number;
 }
 
+/** A lightweight, deterministic content signature; it needs no image decoder. */
+export function signatureFromBytes(bytes: Uint8Array, buckets = 32): number[] {
+  if (!bytes.length) return [];
+  return Array.from({ length: buckets }, (_, bucket) => {
+    const start = Math.floor((bucket * bytes.length) / buckets);
+    const end = Math.max(start + 1, Math.floor(((bucket + 1) * bytes.length) / buckets));
+    let total = 0;
+    for (let index = start; index < end; index++) total += bytes[index];
+    return total / (end - start);
+  });
+}
+
+export function changeScoresFromSignatures(signatures: number[][]): number[] {
+  return signatures.map((signature, index) => {
+    if (!index || !signature.length || signature.length !== signatures[index - 1].length) return 0;
+    const prior = signatures[index - 1];
+    return Math.min(1, signature.reduce((sum, value, bucket) => sum + Math.abs(value - prior[bucket]), 0) / (signature.length * 255));
+  });
+}
+
+export async function computeKeyframeChangeScores(keyframes: Keyframe[]): Promise<number[]> {
+  const signatures = await Promise.all(keyframes.map(async (keyframe) => signatureFromBytes(await readFile(keyframe.path))));
+  return changeScoresFromSignatures(signatures);
+}
+
 const DEFAULT_WIDTH = 800;
 const FRAME_PATTERN = /^frame_(\d{4})\.jpg$/;
 
