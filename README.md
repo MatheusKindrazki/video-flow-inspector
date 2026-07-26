@@ -72,9 +72,9 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `KEYFRAME_INTERVAL_SECONDS` | `2` | Seconds between keyframe extractions |
 | `FRAME_CHANGE_THRESHOLD` | `0.15` | Change score at which a candidate is treated as relevant |
 | `FRAME_SAFETY_INTERVAL_MS` | `3000` | Maximum target gap between selected frames |
-| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Economical Gemini analysis model |
+| `GEMINI_MODEL` | `gemini-3.1-flash-lite` | Economical Gemini analysis model |
 | `GEMINI_ESCALATION_ENABLED` | `false` | Re-run once with Flash for low-confidence or serious results |
-| `GEMINI_ESCALATION_MODEL` | `gemini-2.5-flash` | Model used for the optional escalation |
+| `GEMINI_ESCALATION_MODEL` | `gemini-3.5-flash` | Model used for the optional escalation |
 | `GEMINI_ESCALATION_CONFIDENCE_THRESHOLD` | `0.5` | Escalate when all reported hypothesis confidence is below this value |
 | `GEMINI_ESCALATION_ON_CRITICAL` | `true` | Escalate when a critical or major issue is found |
 | `GEMINI_TIMEOUT_REDUCE_FRAMES` | `true` | Retry timeouts once with a reduced image payload when possible |
@@ -89,14 +89,14 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 
 Candidates are over-sampled from the video, then selected locally using a byte-bucket visual-change signature, relevance threshold, temporal safety sampling, and first/last anchors. Discarded images are deleted before any base64 payload is created. This is intentionally a best-effort, dependency-free heuristic rather than local vision analysis.
 
-Gemini defaults to `gemini-2.5-flash-lite`. Escalation is opt-in and happens at most once, from Flash-Lite to Flash, before cross-provider fallback. Permanent 4xx errors are not retried; transient errors, rate limits, and timeouts are. Malformed JSON is repaired locally before a request is retried.
+Gemini defaults to `gemini-3.1-flash-lite`. Escalation is opt-in and happens at most once, from Flash-Lite to `gemini-3.5-flash`, before cross-provider fallback. Permanent 4xx errors are not retried; transient errors, rate limits, and timeouts are. Malformed JSON is repaired locally before a request is retried.
 
 Token pricing (USD per million tokens; Google Gemini pricing confirmed 2026-07-26):
 
 | Model | Input | Output | Source |
 |---|---:|---:|---|
-| `gemini-2.5-flash-lite` | $0.10 | $0.40 | confirmed |
-| `gemini-2.5-flash` | $0.30 | $2.50 | confirmed |
+| `gemini-3.1-flash-lite` | $0.25 | $1.50 | confirmed |
+| `gemini-3.5-flash` | $1.50 | $9.00 | confirmed |
 
 Responses retain `keyframes_analyzed` and `cost_estimate_usd` for compatibility. `cost_estimate_usd` equals `metadata.cost.total_cost_usd`. Additional metadata is additive:
 
@@ -104,7 +104,7 @@ Responses retain `keyframes_analyzed` and `cost_estimate_usd` for compatibility.
 {
   "frames": { "candidates": 24, "analyzed": 12, "discarded": 12, "selection_strategy": "adaptive(...)" },
   "usage": { "input_tokens": 1200, "output_tokens": 300 },
-  "cost": { "input_cost_usd": 0.00012, "output_cost_usd": 0.00012, "total_cost_usd": 0.00024, "pricing_source": "confirmed" },
+  "cost": { "input_cost_usd": 0.0003, "output_cost_usd": 0.00045, "total_cost_usd": 0.00075, "pricing_source": "confirmed" },
   "escalation": { "triggered": false },
   "retries": { "attempts": 1, "json_repaired": false, "frames_reduced": false }
 }
@@ -214,7 +214,7 @@ Supported video formats: `.mp4`, `.webm`, `.mov`, `.avi`, `.mkv`
   "confidence": 0.87,
   "metadata": {
     "provider": "gemini",
-    "model": "gemini-2.5-flash",
+    "model": "gemini-3.1-flash-lite",
     "video_duration_ms": 10000,
     "keyframes_analyzed": 5,
     "analysis_duration_ms": 8500,
@@ -263,7 +263,7 @@ Input Validation --> Video Ingestion --> Keyframe Extraction --> LLM Analysis --
 
 | Provider | Model | Best For |
 |---|---|---|
-| **Google Gemini** (default) | `gemini-2.5-flash` | Fast, cost-effective analysis with strong vision |
+| **Google Gemini** (default) | `gemini-3.1-flash-lite` | Fast, cost-effective analysis with strong vision |
 | **OpenAI** (fallback) | `gpt-4o` | High-quality analysis, good as fallback |
 | **Anthropic** (future) | `claude-sonnet-4-6-20250514` | Reserved for future use |
 
