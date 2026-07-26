@@ -103,6 +103,11 @@ export interface AnalysisMetadata {
   keyframes_analyzed: number;
   analysis_duration_ms: number;
   cost_estimate_usd?: number;
+  frames?: { candidates: number; analyzed: number; discarded: number; selection_strategy: string };
+  usage?: { input_tokens: number; output_tokens: number };
+  cost?: { input_cost_usd: number; output_cost_usd: number; total_cost_usd: number; pricing_source: "confirmed" | "heuristic" };
+  escalation?: { triggered: boolean; from_model?: string; to_model?: string; reason?: string; from_usage?: { input_tokens: number; output_tokens: number } };
+  retries?: { attempts: number; json_repaired: boolean; frames_reduced: boolean };
 }
 
 // ─── Full Analysis Output ───────────────────────────────────────────────────
@@ -179,5 +184,14 @@ export interface AppConfig {
   maxVideoSizeMB: number;
   maxVideoDurationSeconds: number;
   logLevel: string;
+  gemini: {
+    escalationModel: string;
+    escalationEnabled: boolean;
+    escalationConfidenceThreshold: number;
+    escalationOnCritical: boolean;
+    maxOutputTokens: number;
+    timeoutReduceFrames: boolean;
+  };
+  frameSelection: { changeThreshold: number; safetyIntervalMs: number };
   providers: Record<ProviderName, ProviderConfig | undefined>;
 }

@@ -66,6 +66,10 @@ export interface ProviderAnalysisResult {
     input_tokens: number;
     output_tokens: number;
   };
+  meta?: {
+    retries: { attempts: number; json_repaired: boolean; frames_reduced: boolean };
+    escalation: { triggered: boolean; from_model?: string; to_model?: string; reason?: string; from_usage?: { input_tokens: number; output_tokens: number } };
+  };
 }
 
 // ─── Analysis Provider Interface ───────────────────────────────────────────

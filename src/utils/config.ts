@@ -2,7 +2,7 @@ import type { AppConfig, ProviderConfig, ProviderName } from "../types/index.js"
 import { ConfigError } from "./errors.js";
 
 const DEFAULT_MODELS: Record<ProviderName, string> = {
-  gemini: "gemini-2.5-flash",
+  gemini: "gemini-2.5-flash-lite",
   openai: "gpt-4o",
   anthropic: "claude-sonnet-4-6-20250514",
 };
@@ -35,6 +35,11 @@ function buildProviderConfig(name: ProviderName): ProviderConfig | undefined {
 
 function isValidProvider(value: string): value is ProviderName {
   return ["gemini", "openai", "anthropic"].includes(value);
+}
+
+function booleanEnv(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined) return defaultValue;
+  return value.toLowerCase() === "true";
 }
 
 export function loadConfig(): AppConfig {
@@ -75,6 +80,18 @@ export function loadConfig(): AppConfig {
     maxVideoSizeMB: parseInt(process.env.MAX_VIDEO_SIZE_MB || "150", 10),
     maxVideoDurationSeconds: parseInt(process.env.MAX_VIDEO_DURATION_SECONDS || "300", 10),
     logLevel: process.env.LOG_LEVEL || "info",
+    gemini: {
+      escalationModel: process.env.GEMINI_ESCALATION_MODEL || "gemini-2.5-flash",
+      escalationEnabled: booleanEnv(process.env.GEMINI_ESCALATION_ENABLED, false),
+      escalationConfidenceThreshold: parseFloat(process.env.GEMINI_ESCALATION_CONFIDENCE_THRESHOLD || "0.5"),
+      escalationOnCritical: booleanEnv(process.env.GEMINI_ESCALATION_ON_CRITICAL, true),
+      maxOutputTokens: parseInt(process.env.MAX_OUTPUT_TOKENS || "8192", 10),
+      timeoutReduceFrames: booleanEnv(process.env.GEMINI_TIMEOUT_REDUCE_FRAMES, true),
+    },
+    frameSelection: {
+      changeThreshold: parseFloat(process.env.FRAME_CHANGE_THRESHOLD || "0.15"),
+      safetyIntervalMs: parseInt(process.env.FRAME_SAFETY_INTERVAL_MS || "3000", 10),
+    },
     providers,
   };
 }
