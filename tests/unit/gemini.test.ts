@@ -43,11 +43,25 @@ describe("GeminiProvider", () => {
     expect(result.meta?.retries.json_repaired).toBe(true);
   });
 
+  it("retries once when JSON cannot be repaired", async () => {
+    const client = clientWith(["not JSON", valid()]);
+    const result = await new GeminiProvider("unused", "gemini-2.5-flash-lite", 2, 100, { client, retryDelayMs: 0 }).analyze(context);
+    expect(client.models).toHaveLength(2);
+    expect(result.meta?.retries.attempts).toBe(2);
+  });
+
   it("escalates once on low confidence when enabled", async () => {
     const client = clientWith([valid([{ confidence: 0.2 }]), valid([{ confidence: 0.9 }])]);
     const result = await new GeminiProvider("unused", "gemini-2.5-flash-lite", 1, 100, { client, escalationEnabled: true, escalationConfidenceThreshold: 0.5, retryDelayMs: 0 }).analyze(context);
     expect(client.models).toEqual(["gemini-2.5-flash-lite", "gemini-2.5-flash"]);
     expect(result.meta?.escalation.triggered).toBe(true);
+  });
+
+  it("escalates when the Lite response remains ambiguous after repair", async () => {
+    const client = clientWith(["not JSON", valid()]);
+    const result = await new GeminiProvider("unused", "gemini-2.5-flash-lite", 1, 100, { client, escalationEnabled: true, retryDelayMs: 0 }).analyze(context);
+    expect(client.models).toEqual(["gemini-2.5-flash-lite", "gemini-2.5-flash"]);
+    expect(result.meta?.escalation.reason).toBe("ambiguous_response");
   });
 
   it("does not escalate when disabled", async () => {

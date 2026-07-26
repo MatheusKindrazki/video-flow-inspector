@@ -37,7 +37,16 @@ export class GeminiProvider implements AnalysisProvider {
   }
 
   async analyze(context: AnalysisContext): Promise<ProviderAnalysisResult> {
-    const first = await this.analyzeModel(context, this.model);
+    let first: Awaited<ReturnType<GeminiProvider["analyzeModel"]>>;
+    try {
+      first = await this.analyzeModel(context, this.model);
+    } catch (error) {
+      if (this.options.escalationEnabled && this.model !== this.options.escalationModel && error instanceof ProviderError && error.message === "Failed to parse Gemini response as JSON") {
+        const escalated = await this.analyzeModel(context, this.options.escalationModel);
+        return this.toResult(escalated, { triggered: true, from_model: this.model, to_model: this.options.escalationModel, reason: "ambiguous_response" });
+      }
+      throw error;
+    }
     const reason = this.escalationReason(first.parsed);
     if (this.options.escalationEnabled && reason && this.model !== this.options.escalationModel) {
       const escalated = await this.analyzeModel(context, this.options.escalationModel);
@@ -64,7 +73,8 @@ export class GeminiProvider implements AnalysisProvider {
         return { raw, parsed: parsedResult.parsed, usage: usage ? { input_tokens: usage.promptTokenCount ?? 0, output_tokens: usage.candidatesTokenCount ?? 0 } : undefined, attempts: attempt, repaired, reduced };
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
-        if (!this.isTransient(lastError) || attempt === this.maxRetries) throw lastError;
+        const parseFailure = lastError instanceof ProviderError && lastError.message === "Failed to parse Gemini response as JSON";
+        if (!(this.isTransient(lastError) || parseFailure) || attempt === this.maxRetries) throw lastError;
         if (lastError instanceof ProviderTimeoutError && this.options.timeoutReduceFrames && frames.length > 2) {
           frames = frames.filter((_, index) => index === 0 || index === frames.length - 1 || index % 2 === 0);
           reduced = true;
