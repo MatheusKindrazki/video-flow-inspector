@@ -121,3 +121,10 @@ test('bounds retained terminal records and protects returned snapshots from call
   assert.equal((await manager.get(ids.at(-1))).status, 'completed');
   await manager.close();
 });
+test('concurrent close calls share settlement and directory-lock release',async t=>{
+ const dir=await directory(t);let release;let entered;
+ const started=new Promise(r=>entered=r);const wait=new Promise(r=>release=r);
+ const m=new AnalysisJobManager({directory:dir,execute:async()=>{entered();await wait;return 1;}});await m.start({});await started;
+ const a=m.close();const b=m.close();assert.strictEqual(a,b);release();await Promise.all([a,b]);
+ const replacement=new AnalysisJobManager({directory:dir,execute:async()=>2});const job=await replacement.start({});assert.ok(job.id);await replacement.close();
+});

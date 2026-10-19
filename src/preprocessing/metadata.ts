@@ -2,9 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { stat } from "node:fs/promises";
 import { KeyframeExtractionError } from "../utils/errors.js";
-
 const execFileAsync = promisify(execFile);
-
 interface VideoMetadata {
   duration_ms: number;
   width: number;
@@ -13,24 +11,24 @@ interface VideoMetadata {
   codec: string;
   size_bytes: number;
   format: string;
+  has_audio: boolean;
 }
-
 /**
  * Check whether ffmpeg and ffprobe are available on the system PATH.
  * Returns true only if both binaries can be executed.
  */
-export async function checkFfmpegAvailable(): Promise<boolean> {
+export async function checkFfmpegAvailable(signal?: AbortSignal): Promise<boolean> {
   try {
     await Promise.all([
-      execFileAsync("ffprobe", ["-version"]),
-      execFileAsync("ffmpeg", ["-version"]),
+      execFileAsync("ffprobe", ["-version"], { signal, timeout: 10000 }),
+      execFileAsync("ffmpeg", ["-version"], { signal, timeout: 10000 }),
     ]);
     return true;
-  } catch {
+  }
+  catch {
     return false;
   }
 }
-
 /**
  * Extract metadata from a video file using ffprobe.
  *
@@ -43,21 +41,16 @@ export async function checkFfmpegAvailable(): Promise<boolean> {
  * @throws {KeyframeExtractionError} if ffprobe is not installed, the file
  *   cannot be read, or the output cannot be parsed.
  */
-export async function extractVideoMetadata(
-  filePath: string,
-): Promise<VideoMetadata> {
+export async function extractVideoMetadata(filePath: string, signal?: AbortSignal): Promise<VideoMetadata> {
   // Verify the file exists and get its size on disk.
   let fileSizeBytes: number;
   try {
     const fileStat = await stat(filePath);
     fileSizeBytes = fileStat.size;
-  } catch (err) {
-    throw new KeyframeExtractionError(
-      `Cannot access video file: ${filePath}`,
-      { filePath, cause: String(err) },
-    );
   }
-
+  catch (err) {
+    throw new KeyframeExtractionError(`Cannot access video file: ${filePath}`, { filePath, cause: String(err) });
+  }
   // Run ffprobe.
   let stdout: string;
   try {
@@ -69,82 +62,57 @@ export async function extractVideoMetadata(
       "-show_format",
       "-show_streams",
       filePath,
-    ]);
+    ], { signal, timeout: 30000 });
     stdout = result.stdout;
-  } catch (err: unknown) {
-    const execError = err as { code?: string; stderr?: string };
-
-    if (execError.code === "ENOENT") {
-      throw new KeyframeExtractionError(
-        "ffprobe is not installed or not found on PATH. Please install ffmpeg (which includes ffprobe) and try again.",
-        { filePath },
-      );
-    }
-
-    throw new KeyframeExtractionError(
-      `ffprobe failed for file: ${filePath}`,
-      {
-        filePath,
-        stderr: execError.stderr ?? String(err),
-      },
-    );
   }
-
+  catch (err: unknown) {
+    const execError = err as {
+      code?: string;
+      stderr?: string;
+    };
+    if (execError.code === "ENOENT") {
+      throw new KeyframeExtractionError("ffprobe is not installed or not found on PATH. Please install ffmpeg (which includes ffprobe) and try again.", { filePath });
+    }
+    throw new KeyframeExtractionError(`ffprobe failed for file: ${filePath}`, {
+      filePath,
+      stderr: execError.stderr ?? String(err),
+    });
+  }
   // Parse the JSON output.
   let probeData: {
     streams?: Array<Record<string, unknown>>;
     format?: Record<string, unknown>;
   };
-
   try {
     probeData = JSON.parse(stdout);
-  } catch {
-    throw new KeyframeExtractionError(
-      "Failed to parse ffprobe JSON output",
-      { filePath, rawOutput: stdout },
-    );
   }
-
+  catch {
+    throw new KeyframeExtractionError("Failed to parse ffprobe JSON output", { filePath, rawOutput: stdout });
+  }
   // Find the first video stream.
-  const videoStream = probeData.streams?.find(
-    (s) => s.codec_type === "video",
-  );
-
+  const videoStream = probeData.streams?.find((s) => s.codec_type === "video");
   if (!videoStream) {
-    throw new KeyframeExtractionError(
-      "No video stream found in file",
-      { filePath },
-    );
+    throw new KeyframeExtractionError("No video stream found in file", { filePath });
   }
-
   // Extract duration. Prefer format-level duration, fall back to stream.
-  const rawDuration =
-    probeData.format?.duration ?? videoStream.duration;
+  const rawDuration = probeData.format?.duration ?? videoStream.duration;
   const durationSeconds = parseFloat(String(rawDuration ?? "0"));
   const durationMs = Math.round(durationSeconds * 1000);
-
+  if (!Number.isFinite(durationMs) || durationMs <= 0)
+    throw new KeyframeExtractionError("Video duration must be finite and positive");
   // Extract dimensions.
   const width = Number(videoStream.width ?? 0);
   const height = Number(videoStream.height ?? 0);
-
   // Extract FPS from avg_frame_rate or r_frame_rate (format: "num/den").
-  const fps = parseFps(
-    String(videoStream.avg_frame_rate ?? videoStream.r_frame_rate ?? "0/1"),
-  );
-
+  const fps = parseFps(String(videoStream.avg_frame_rate ?? videoStream.r_frame_rate ?? "0/1"));
   // Extract codec name.
   const codec = String(videoStream.codec_name ?? "unknown");
-
   // Extract container format.
-  const format = String(
-    probeData.format?.format_name ?? "unknown",
-  );
-
+  const format = String(probeData.format?.format_name ?? "unknown");
   // Prefer format-level size if available, fall back to fs stat.
   const sizeBytes = probeData.format?.size
     ? Number(probeData.format.size)
     : fileSizeBytes;
-
   return {
     duration_ms: durationMs,
     width,
@@ -153,9 +121,9 @@ export async function extractVideoMetadata(
     codec,
     size_bytes: sizeBytes,
     format,
+    has_audio: probeData.streams?.some(s => s.codec_type === "audio") ?? false,
   };
 }
-
 /**
  * Parse an ffprobe frame-rate string like "30000/1001" or "30/1" into a
  * floating-point number. Returns 0 if the string cannot be parsed.
@@ -169,7 +137,6 @@ function parseFps(fpsString: string): number {
       return Math.round((numerator / denominator) * 100) / 100;
     }
   }
-
   const direct = parseFloat(fpsString);
   return Number.isNaN(direct) ? 0 : direct;
 }

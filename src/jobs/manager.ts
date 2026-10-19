@@ -56,6 +56,7 @@ export class AnalysisJobManager<I, O> {
   private readonly ready: Promise<void>;
   private operations: Promise<unknown> = Promise.resolve();
   private closing = false;
+  private shutdown?: Promise<void>;
   private ownsLock = false;
 
   constructor(options: AnalysisJobOptions<I, O>) {
@@ -116,9 +117,10 @@ export class AnalysisJobManager<I, O> {
     });
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> { return this.shutdown ??= this.finishClose(); }
+
+  private async finishClose(): Promise<void> {
     await this.ready;
-    if (this.closing) { await this.operations; await Promise.allSettled([...this.active.values()].map(value => value.task)); return; }
     await this.operation(async () => {
       this.closing = true;
       for (const record of this.records.values()) {

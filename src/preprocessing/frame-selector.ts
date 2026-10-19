@@ -3,76 +3,68 @@ export interface FrameDescriptor {
   timestamp_ms: number;
   changeScore: number;
 }
-
 export interface FrameSelectionOptions {
   maxFrames: number;
   changeThreshold: number;
   safetyIntervalMs: number;
   minFrames: number;
 }
-
 export interface FrameSelectionResult {
   selected: FrameDescriptor[];
   discarded: FrameDescriptor[];
   strategy: string;
-  stats: { candidates: number; selected_count: number; discarded_count: number; by_relevance: number; by_safety: number; by_anchor: number };
+  stats: {
+    candidates: number;
+    selected_count: number;
+    discarded_count: number;
+    by_relevance: number;
+    by_safety: number;
+    by_anchor: number;
+  };
 }
-
-type Reason = "anchor" | "relevance" | "safety";
-
+/** Reserve temporal coverage before relevance can consume the entire budget. */
 export function selectKeyframes(frames: FrameDescriptor[], options: FrameSelectionOptions): FrameSelectionResult {
-  const unique = frames.filter((frame, position) => frames.findIndex((candidate) => candidate.index === frame.index) === position)
-    .sort((a, b) => a.index - b.index);
-  const selected = new Map<number, Reason>();
-  const add = (frame: FrameDescriptor, reason: Reason): void => { if (!selected.has(frame.index)) selected.set(frame.index, reason); };
-  if (unique.length) add(unique[0], "anchor");
-  if (unique.length > 1) add(unique.at(-1)!, "anchor");
-
-  for (const frame of unique) if (frame.changeScore >= options.changeThreshold) add(frame, "relevance");
-
-  let lastSelectedTimestamp = unique[0]?.timestamp_ms;
-  for (const frame of unique) {
-    if (frame.index === unique[0]?.index) continue;
-    if (lastSelectedTimestamp !== undefined && frame.timestamp_ms - lastSelectedTimestamp >= options.safetyIntervalMs) {
-      add(frame, "safety");
-      lastSelectedTimestamp = frame.timestamp_ms;
-    } else if (selected.has(frame.index)) {
-      lastSelectedTimestamp = frame.timestamp_ms;
+  const unique = [...new Map(frames.map(f => [f.index, f])).values()].sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+  const cap = Math.max(1, Math.floor(options.maxFrames));
+  const selected = new Map<number, 'anchor' | 'relevance' | 'safety'>();
+  const add = (f: FrameDescriptor, reason: 'anchor' | 'relevance' | 'safety') => { if (!selected.has(f.index))
+    selected.set(f.index, reason); };
+  if (unique.length)
+    add(unique[0], 'anchor');
+  if (unique.length > 1 && cap > 1)
+    add(unique.at(-1)!, 'anchor');
+  const relevant = unique.filter(f => f.changeScore >= options.changeThreshold).sort((a, b) => b.changeScore - a.changeScore || a.timestamp_ms - b.timestamp_ms);
+  for (const f of relevant)
+    add(f, 'relevance');
+  let last = unique[0]?.timestamp_ms ?? 0;
+  for (const f of unique) {
+    if (f.timestamp_ms - last >= options.safetyIntervalMs) {
+      add(f, 'safety');
+      last = f.timestamp_ms;
     }
+    else if (selected.has(f.index))
+      last = f.timestamp_ms;
   }
-
-  const targetMin = Math.min(options.minFrames, options.maxFrames);
-  while (selected.size < targetMin) {
-    const available = unique.filter((frame) => !selected.has(frame.index));
-    if (!available.length) break;
-    const rank = Math.floor((available.length - 1) / 2);
-    add(available[rank], "safety");
+  const distance = (f: FrameDescriptor) => Math.min(...unique.filter(x => selected.has(x.index)).map(x => Math.abs(x.timestamp_ms - f.timestamp_ms)));
+  while (selected.size < Math.min(options.minFrames, cap, unique.length)) {
+    const f = unique.filter(x => !selected.has(x.index)).sort((a, b) => distance(b) - distance(a))[0];
+    if (!f)
+      break;
+    add(f, 'safety');
   }
-
-  const anchors = new Set(options.maxFrames >= 2 ? [unique[0]?.index, unique.at(-1)?.index] : [unique[0]?.index]);
-  while (selected.size > options.maxFrames) {
-    const removable = unique.filter((frame) => selected.has(frame.index) && !anchors.has(frame.index))
-      .sort((a, b) => a.changeScore - b.changeScore || b.index - a.index);
-    if (!removable.length) break;
+  while (selected.size > cap) {
+    const active = unique.filter(f => selected.has(f.index));
+    const duration = Math.max(1, unique.at(-1)!.timestamp_ms - unique[0].timestamp_ms);
+    const removable = active.filter(f => f.index !== unique[0].index && (cap === 1 || f.index !== unique.at(-1)!.index));
+    const penalty = (f: FrameDescriptor) => { const i = active.indexOf(f); const merged = (active[i + 1]?.timestamp_ms ?? f.timestamp_ms) - (active[i - 1]?.timestamp_ms ?? f.timestamp_ms); return merged / duration + (f.changeScore >= options.changeThreshold ? .01 * f.changeScore : 0); };
+    removable.sort((a, b) => penalty(a) - penalty(b) || a.timestamp_ms - b.timestamp_ms);
+    if (!removable.length)
+      break;
     selected.delete(removable[0].index);
   }
-
-  const selectedFrames = unique.filter((frame) => selected.has(frame.index));
-  const selectedIndexes = new Set(selectedFrames.map((frame) => frame.index));
-  const discarded = frames.filter((frame, position) => !selectedIndexes.has(frame.index) || frames.findIndex((candidate) => candidate.index === frame.index) !== position)
-    .sort((a, b) => a.index - b.index);
+  const chosen = unique.filter(f => selected.has(f.index));
+  const seen = new Set<number>();
+  const discarded = frames.filter(f => { const duplicate = seen.has(f.index); seen.add(f.index); return duplicate || !selected.has(f.index); });
   const reasons = [...selected.values()];
-  return {
-    selected: selectedFrames,
-    discarded,
-    strategy: `adaptive(cap=${options.maxFrames},change>=${options.changeThreshold},safety=${options.safetyIntervalMs}ms)`,
-    stats: {
-      candidates: frames.length,
-      selected_count: selectedFrames.length,
-      discarded_count: discarded.length,
-      by_relevance: reasons.filter((reason) => reason === "relevance").length,
-      by_safety: reasons.filter((reason) => reason === "safety").length,
-      by_anchor: reasons.filter((reason) => reason === "anchor").length,
-    },
-  };
+  return { selected: chosen, discarded, strategy: `balanced(cap=${cap},change>=${options.changeThreshold},safety=${options.safetyIntervalMs}ms)`, stats: { candidates: frames.length, selected_count: chosen.length, discarded_count: discarded.length, by_anchor: reasons.filter(x => x === 'anchor').length, by_relevance: reasons.filter(x => x === 'relevance').length, by_safety: reasons.filter(x => x === 'safety').length } };
 }

@@ -1,44 +1,29 @@
 import OpenAI from "openai";
-import {
-  AnalysisProvider,
-  AnalysisContext,
-  ProviderAnalysisResult,
-} from "./provider.js";
-import {
-  buildSystemPrompt,
-  buildUserPrompt,
-  buildOutputSchemaPrompt,
-} from "./prompt-builder.js";
+import { AnalysisProvider, AnalysisContext, ProviderAnalysisResult, } from "./provider.js";
+import { buildSystemPrompt, buildUserPrompt, buildOutputSchemaPrompt, } from "./prompt-builder.js";
 import { ProviderError, ProviderTimeoutError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
-
 export class OpenAIProvider implements AnalysisProvider {
   name = "openai";
   private client: OpenAI;
   private model: string;
   private maxRetries: number;
   private timeoutMs: number;
-
-  constructor(
-    apiKey: string,
-    model: string = "gpt-4o",
-    maxRetries = 3,
-    timeoutMs = 120000
-  ) {
-    this.client = new OpenAI({ apiKey });
+  constructor(apiKey: string, model: string = "gpt-4o", maxRetries = 3, timeoutMs = 120000) {
+    this.client = new OpenAI({ apiKey, maxRetries: 0 });
     this.model = model;
     this.maxRetries = maxRetries;
     this.timeoutMs = timeoutMs;
   }
-
   async analyze(context: AnalysisContext): Promise<ProviderAnalysisResult> {
+    context.signal?.throwIfAborted();
+    if (context.audio)
+      throw new ProviderError("OpenAI image adapter does not support audio; configure Gemini or explicitly ignore audio");
     const systemPrompt = buildSystemPrompt();
     const userPrompt = buildUserPrompt(context);
-
     const contentParts: OpenAI.ChatCompletionContentPart[] = [
       { type: "text", text: userPrompt },
     ];
-
     for (const keyframe of context.keyframes) {
       if (!keyframe.base64) {
         logger.warn("Keyframe missing base64 data, skipping", {
@@ -47,7 +32,6 @@ export class OpenAIProvider implements AnalysisProvider {
         });
         continue;
       }
-
       contentParts.push({
         type: "image_url",
         image_url: {
@@ -56,25 +40,18 @@ export class OpenAIProvider implements AnalysisProvider {
         },
       });
     }
-
     let lastError: Error | null = null;
-
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
+        context.signal?.throwIfAborted();
+        context.reserveCall?.();
         logger.info("OpenAI API call starting", {
           attempt,
           model: this.model,
           keyframe_count: context.keyframes.length,
         });
-
-        const completion = await this.callWithTimeout(
-          systemPrompt,
-          contentParts,
-          attempt
-        );
-
+        const completion = await this.callWithTimeout(systemPrompt, contentParts, attempt, context.signal);
         const rawText = completion.choices[0]?.message?.content ?? "";
-
         if (!rawText || rawText.trim().length === 0) {
           throw new ProviderError("OpenAI returned empty response", {
             attempt,
@@ -82,22 +59,18 @@ export class OpenAIProvider implements AnalysisProvider {
             finish_reason: completion.choices[0]?.finish_reason,
           });
         }
-
         logger.debug("OpenAI raw response received", {
           attempt,
           response_length: rawText.length,
           finish_reason: completion.choices[0]?.finish_reason,
         });
-
         const parsed = this.parseResponse(rawText);
-
         const usageStats = completion.usage
           ? {
-              input_tokens: completion.usage.prompt_tokens,
-              output_tokens: completion.usage.completion_tokens,
-            }
+            input_tokens: completion.usage.prompt_tokens,
+            output_tokens: completion.usage.completion_tokens,
+          }
           : undefined;
-
         logger.info("OpenAI analysis completed successfully", {
           attempt,
           model: this.model,
@@ -106,9 +79,9 @@ export class OpenAIProvider implements AnalysisProvider {
           input_tokens: usageStats?.input_tokens,
           output_tokens: usageStats?.output_tokens,
         });
-
         return {
           raw: rawText,
+          findings: parsed.findings, transcript: parsed.transcript, output_warnings: parsed.output_warnings,
           summary: parsed.summary,
           timeline: parsed.timeline,
           detected_issues: parsed.detected_issues,
@@ -116,9 +89,10 @@ export class OpenAIProvider implements AnalysisProvider {
           recommended_actions: parsed.recommended_actions,
           usage: usageStats,
         };
-      } catch (error) {
+      }
+      catch (error) {
+        context.signal?.throwIfAborted();
         lastError = error instanceof Error ? error : new Error(String(error));
-
         if (error instanceof ProviderTimeoutError) {
           logger.error("OpenAI API call timed out", {
             attempt,
@@ -127,13 +101,19 @@ export class OpenAIProvider implements AnalysisProvider {
           if (attempt === this.maxRetries) {
             throw error;
           }
-        } else {
+        }
+        else {
           logger.error("OpenAI API call failed", {
             attempt,
             error: lastError.message,
           });
         }
-
+        const status = (error as {
+          status?: number;
+        })?.status;
+        const transient = typeof status === "number" ? status === 429 || status >= 500 : /network|fetch|socket|econn|timeout/i.test(lastError.message);
+        if (!transient)
+          throw lastError;
         if (attempt < this.maxRetries) {
           const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 16000);
           logger.info("Retrying OpenAI API call", {
@@ -144,68 +124,53 @@ export class OpenAIProvider implements AnalysisProvider {
         }
       }
     }
-
-    throw new ProviderError(
-      `OpenAI analysis failed after ${this.maxRetries} attempts: ${lastError?.message ?? "unknown error"}`,
-      {
-        provider: this.name,
-        model: this.model,
-        attempts: this.maxRetries,
-      }
-    );
+    throw new ProviderError(`OpenAI analysis failed after ${this.maxRetries} attempts: ${lastError?.message ?? "unknown error"}`, {
+      provider: this.name,
+      model: this.model,
+      attempts: this.maxRetries,
+    });
   }
-
-  private async callWithTimeout(
-    systemPrompt: string,
-    contentParts: OpenAI.ChatCompletionContentPart[],
-    attempt: number
-  ): Promise<OpenAI.ChatCompletion> {
+  private async callWithTimeout(systemPrompt: string, contentParts: OpenAI.ChatCompletionContentPart[], attempt: number, signal?: AbortSignal): Promise<OpenAI.ChatCompletion> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
-
     try {
-      const completion = await this.client.chat.completions.create(
-        {
-          model: this.model,
-          response_format: { type: "json_object" },
-          temperature: 0.1,
-          messages: [
-            {
-              role: "system",
-              content: systemPrompt,
-            },
-            {
-              role: "user",
-              content: contentParts,
-            },
-          ],
-        },
-        { signal: controller.signal }
-      );
-
-      return completion;
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        (error.name === "AbortError" || error.message.includes("abort"))
-      ) {
-        throw new ProviderTimeoutError(
-          `OpenAI API call timed out after ${this.timeoutMs}ms`,
+      const completion = await this.client.chat.completions.create({
+        model: this.model,
+        response_format: { type: "json_object" },
+        temperature: 0.1,
+        messages: [
           {
-            provider: this.name,
-            model: this.model,
-            timeout_ms: this.timeoutMs,
-            attempt,
-          }
-        );
+            role: "system",
+            content: systemPrompt,
+          },
+          {
+            role: "user",
+            content: contentParts,
+          },
+        ],
+      }, { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal });
+      return completion;
+    }
+    catch (error) {
+      if (error instanceof Error &&
+        (error.name === "AbortError" || error.message.includes("abort"))) {
+        throw new ProviderTimeoutError(`OpenAI API call timed out after ${this.timeoutMs}ms`, {
+          provider: this.name,
+          model: this.model,
+          timeout_ms: this.timeoutMs,
+          attempt,
+        });
       }
       throw error;
-    } finally {
+    }
+    finally {
       clearTimeout(timeoutId);
     }
   }
-
   private parseResponse(rawText: string): {
+    findings?: unknown[];
+    transcript?: unknown[];
+    output_warnings?: string[];
     summary: string;
     timeline: ProviderAnalysisResult["timeline"];
     detected_issues: ProviderAnalysisResult["detected_issues"];
@@ -213,7 +178,6 @@ export class OpenAIProvider implements AnalysisProvider {
     recommended_actions: ProviderAnalysisResult["recommended_actions"];
   } {
     let text = rawText.trim();
-
     // Strip markdown code fences if present
     if (text.startsWith("```")) {
       const firstNewline = text.indexOf("\n");
@@ -222,42 +186,37 @@ export class OpenAIProvider implements AnalysisProvider {
         text = text.slice(0, -3).trim();
       }
     }
-
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(text);
-    } catch {
+    }
+    catch {
       logger.error("Failed to parse OpenAI response as JSON", {
-        response_preview: text.slice(0, 500),
+        response_length: text.length,
       });
       throw new ProviderError("Failed to parse OpenAI response as JSON", {
         provider: this.name,
         response_preview: text.slice(0, 500),
       });
     }
-
-    const summary =
-      typeof parsed.summary === "string" && parsed.summary.length > 0
-        ? parsed.summary
-        : "Analysis completed but no summary was provided.";
-
+    const summary = typeof parsed.summary === "string" && parsed.summary.length > 0
+      ? parsed.summary
+      : "Analysis completed but no summary was provided.";
     const timeline = Array.isArray(parsed.timeline)
       ? (parsed.timeline as ProviderAnalysisResult["timeline"])
       : [];
-
     const detected_issues = Array.isArray(parsed.detected_issues)
       ? (parsed.detected_issues as ProviderAnalysisResult["detected_issues"])
       : [];
-
     const hypotheses = Array.isArray(parsed.hypotheses)
       ? (parsed.hypotheses as ProviderAnalysisResult["hypotheses"])
       : [];
-
     const recommended_actions = Array.isArray(parsed.recommended_actions)
       ? (parsed.recommended_actions as ProviderAnalysisResult["recommended_actions"])
       : [];
-
     return {
+      output_warnings: Array.isArray(parsed.findings) ? [] : ["structured findings missing or malformed"],
+      findings: Array.isArray(parsed.findings) ? parsed.findings : [], transcript: [],
       summary,
       timeline,
       detected_issues,
@@ -265,7 +224,6 @@ export class OpenAIProvider implements AnalysisProvider {
       recommended_actions,
     };
   }
-
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }

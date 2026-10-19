@@ -1,5 +1,6 @@
+import type { AudioSegment } from "../preprocessing/audio.js";
+import type { Segment } from "../orchestrator/segments.js";
 // ─── Keyframe ──────────────────────────────────────────────────────────────
-
 export interface Keyframe {
   index: number;
   timestamp_ms: number;
@@ -8,11 +9,14 @@ export interface Keyframe {
   width: number;
   height: number;
 }
-
 // ─── Analysis Context ──────────────────────────────────────────────────────
-
 export interface AnalysisContext {
   goal: string;
+  analysis_mode?: "combined" | "bug" | "usability";
+  audio?: AudioSegment;
+  segment?: Segment;
+  signal?: AbortSignal;
+  reserveCall?: () => void;
   app_context?: string;
   expected_flow?: string[];
   environment?: string;
@@ -20,11 +24,12 @@ export interface AnalysisContext {
   keyframes: Keyframe[];
   video_duration_ms: number;
 }
-
 // ─── Provider Analysis Result ──────────────────────────────────────────────
-
 export interface ProviderAnalysisResult {
   raw: string;
+  output_warnings?: string[];
+  findings?: unknown[];
+  transcript?: unknown[];
   summary: string;
   timeline: Array<{
     timestamp_ms: number;
@@ -67,13 +72,24 @@ export interface ProviderAnalysisResult {
     output_tokens: number;
   };
   meta?: {
-    retries: { attempts: number; json_repaired: boolean; frames_reduced: boolean };
-    escalation: { triggered: boolean; from_model?: string; to_model?: string; reason?: string; from_usage?: { input_tokens: number; output_tokens: number } };
+    retries: {
+      attempts: number;
+      json_repaired: boolean;
+      frames_reduced: boolean;
+    };
+    escalation: {
+      triggered: boolean;
+      from_model?: string;
+      to_model?: string;
+      reason?: string;
+      from_usage?: {
+        input_tokens: number;
+        output_tokens: number;
+      };
+    };
   };
 }
-
 // ─── Analysis Provider Interface ───────────────────────────────────────────
-
 export interface AnalysisProvider {
   name: string;
   analyze(context: AnalysisContext): Promise<ProviderAnalysisResult>;

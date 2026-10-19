@@ -1,6 +1,6 @@
 {
   "name": "video-flow-inspector",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for video-based UI flow analysis and debugging",
   "type": "module",
   "main": "dist/index.js",
@@ -14,7 +14,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test:behavior": "npm run build && node --test tests/behavior/*.test.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
