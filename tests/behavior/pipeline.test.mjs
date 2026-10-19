@@ -36,3 +36,17 @@ test('Gemini receives audio alongside frames with absolute segment mapping',asyn
  await new GeminiProvider('fixture','fixture',1,1000,{client}).analyze({goal:'Inspect flow',keyframes:[],video_duration_ms:600000,segment:{id:'S2',start_ms:58000,end_ms:118000},audio:{mimeType:'audio/mpeg',base64:'fixture-audio',start_ms:58000,end_ms:118000}});
  assert.equal(request.contents[0].parts.at(-1).inlineData.mimeType,'audio/mpeg');assert.match(request.contents[0].parts[0].text,/58000ms/);
 });
+test('shared call budget bounds all segments and declares incomplete intervals',async()=>fixture(async(deps,config)=>{
+ config.session.maxProviderCalls=3;const r=await analyzeVideoFlow({goal:'Inspect flow'},{},{...deps,analyze:async c=>provider(c)});
+ assert.equal(r.metadata.provider_calls,3);assert.equal(r.quality.complete,false);assert.ok(r.quality.warnings.some(w=>w.includes('budget exhausted')));
+}));
+test('focused refinement keeps every transcript cited by merged findings',async()=>fixture(async(deps,config)=>{
+ config.session.maxRefinements=1;
+ const r=await analyzeVideoFlow({goal:'Inspect flow'},{},{...deps,analyze:async c=>{const out=provider(c);if(c.segment.id==='S1'||c.segment.id==='R1')out.result.findings[0].severity='critical';return out;}});
+ assert.equal(r.metadata.refinements,1);assert.ok(r.findings.some(f=>f.merged_sources?.includes('R1')));
+ const ids=new Set(r.transcript.map(t=>t.id));for(const f of r.findings)for(const ref of f.evidence_refs)if(ref.kind==='transcript')assert.ok(ids.has(ref.transcript_id));
+}));
+test('missing structured findings cannot hide legacy issues behind a clean result',async()=>fixture(async deps=>{
+ const r=await analyzeVideoFlow({goal:'Inspect flow'},{},{...deps,analyze:async c=>{const out=provider(c);out.result.findings=[];out.result.detected_issues=[{id:'I',severity:'major',type:'unknown',title:'legacy',description:'legacy',actual_behavior:'legacy',evidence:'free text only'}];return out;}});
+ assert.equal(r.findings.length,0);assert.equal(r.quality.complete,false);assert.ok(r.quality.warnings.some(w=>w.includes('legacy issues')));
+}));
