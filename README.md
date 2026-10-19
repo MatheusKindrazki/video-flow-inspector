@@ -8,7 +8,7 @@ This is an evidence-assisted review, not proof of backend correctness, continuou
 
 - Node.js >=20
 - `ffmpeg` and `ffprobe` on PATH, with JPEG/rawvideo encoding and `libmp3lame` for audio
-- Gemini API key for audiovisual analysis; the OpenAI adapter supports images only
+- Gemini Developer API key or Vertex AI Express API key for audiovisual analysis; the OpenAI adapter supports images only
 
 ```sh
 npm ci
@@ -34,6 +34,14 @@ MCP stdio configuration:
 ```
 
 Model IDs are configurable through `GEMINI_MODEL` / `OPENAI_MODEL`. The inherited Gemini defaults are `gemini-3.1-flash-lite` and optional escalation to `gemini-3.5-flash`. **Availability on your account is not established by unit tests**; configure an accessible multimodal model and validate it before operational use. Anthropic is not implemented.
+
+## Vertex AI Express authentication
+
+For a Vertex Express API key, configure `GEMINI_BACKEND=vertex`, `VERTEX_API_KEY`, `DEFAULT_PROVIDER=gemini` and an accessible `GEMINI_MODEL`. This uses the documented global `aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent` endpoint with the `x-goog-api-key` header, not a URL query parameter. Screen/audio payloads and cancellation are preserved. No project/location is needed for Express mode. Standard Vertex project/location ADC authentication is not implemented by this API-key adapter.
+
+The default `GEMINI_BACKEND=gemini` continues to use `GEMINI_API_KEY` with the Gemini Developer API. These credentials/backends are not silently interchangeable. Do not put live keys in repository files or command arguments.
+
+Official reference: https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/express-mode/rest/v1/publishers.models/generateContent
 
 ## Tools
 

@@ -163,6 +163,7 @@ export interface AppConfig {
   maxVideoDurationSeconds: number;
   logLevel: string;
   gemini: {
+    backend:"gemini"|"vertex";
     escalationModel: string;
     escalationEnabled: boolean;
     escalationConfidenceThreshold: number;

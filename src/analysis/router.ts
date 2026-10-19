@@ -1,3 +1,4 @@
+import {VertexExpressClient} from "./vertex.js";
 import { getConfig } from '../utils/config.js';
 import { logger } from '../utils/logger.js';
 import { ProviderError } from '../utils/errors.js';
@@ -17,6 +18,7 @@ function createProvider(name: ProviderName, config: AppConfig): AnalysisProvider
   switch (name) {
     case "gemini":
       return new GeminiProvider(providerConfig.apiKey, providerConfig.model, providerConfig.maxRetries, providerConfig.timeoutMs, {
+        client:config.gemini.backend==="vertex"?new VertexExpressClient(providerConfig.apiKey):undefined,
         escalationModel: config.gemini.escalationModel,
         escalationEnabled: config.gemini.escalationEnabled,
         escalationConfidenceThreshold: config.gemini.escalationConfidenceThreshold,

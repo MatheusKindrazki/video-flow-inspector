@@ -181,7 +181,7 @@ export async function analyzeVideoFlow(input: Partial<AnalyzeVideoFlowInput> & {
         frames: { candidates: results.reduce((n, r) => n + r.candidates, 0), analyzed: allFrames.length, discarded: results.reduce((n, r) => n + r.candidates - r.frames.length, 0), selection_strategy: 'balanced-segmented-pixel-difference', max_sample_gap_ms: Math.max(...gaps) },
         usage: costs.every(c => c.usage) ? { input_tokens: costs.reduce((n, c) => n + c.usage!.input_tokens, 0), output_tokens: costs.reduce((n, c) => n + c.usage!.output_tokens, 0) } : undefined,
         cost: { total_cost_usd: totalCost, pricing_source: useAudio ? 'heuristic' : costs.every(c => c.cost.pricing_source === 'confirmed') ? 'confirmed' : 'heuristic', scope: 'successful provider results only; failed attempts may incur additional cost; configured rates are not live-verified' },
-        segments: segments.length, refinements: results.filter(r => r.segment.id.startsWith('R')).length, provider_calls: calls, max_provider_calls: config.session.maxProviderCalls, provider_runs: costs, audio: { source_has_audio: metadata.has_audio, mode: audioMode, analyzed_segments: results.filter(r => r.audio_status === 'analyzed').length }, confidence_method: 'legacy_uncalibrated_heuristic_not_probability' },
+        segments: segments.length, refinements: results.filter(r => r.segment.id.startsWith('R')).length, provider_calls: calls, max_provider_calls: config.session.maxProviderCalls, provider_runs: costs, audio: { source_has_audio: metadata.has_audio, mode: audioMode, analyzed_segments: results.filter(r => r.audio_status === 'analyzed').length }, gemini_backend:config.gemini.backend, confidence_method: 'legacy_uncalibrated_heuristic_not_probability' },
     };
   }
   catch (error) {

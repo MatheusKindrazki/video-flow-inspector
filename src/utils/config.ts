@@ -16,7 +16,7 @@ const ENV_MODEL_MAP: Record<ProviderName, string> = {
   anthropic: "ANTHROPIC_MODEL",
 };
 function buildProviderConfig(name: ProviderName): ProviderConfig | undefined {
-  const apiKey = process.env[ENV_KEY_MAP[name]] || "";
+  const apiKey = name === "gemini" && process.env.GEMINI_BACKEND === "vertex" ? process.env.VERTEX_API_KEY || "" : process.env[ENV_KEY_MAP[name]] || "";
   if (!apiKey) {
     return undefined;
   }
@@ -39,6 +39,8 @@ function booleanEnv(value: string | undefined, defaultValue: boolean): boolean {
 function boundedEnv(name: string, fallback: number, min: number, max: number): number { const value = Number(process.env[name] ?? fallback); if (!Number.isFinite(value) || value < min || value > max || !Number.isInteger(value))
   throw new ConfigError(`Invalid ${name}: expected an integer from ${min} to ${max}`); return value; }
 export function loadConfig(): AppConfig {
+  const backend=process.env.GEMINI_BACKEND??"gemini";
+  if(backend!=="gemini"&&backend!=="vertex")throw new ConfigError("GEMINI_BACKEND must be gemini or vertex");
   const defaultProvider = process.env.DEFAULT_PROVIDER || "gemini";
   const fallbackProvider = process.env.FALLBACK_PROVIDER || "openai";
   if (!isValidProvider(defaultProvider)) {
@@ -58,7 +60,7 @@ export function loadConfig(): AppConfig {
   };
   const hasAtLeastOneKey = Object.values(providers).some((p) => p !== undefined);
   if (!hasAtLeastOneKey) {
-    throw new ConfigError("No provider API key configured. Set at least one of: GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY");
+    throw new ConfigError("No provider API key configured. Set GEMINI_API_KEY, or GEMINI_BACKEND=vertex with VERTEX_API_KEY, or OPENAI_API_KEY");
   }
   return {
     defaultProvider,
@@ -69,6 +71,7 @@ export function loadConfig(): AppConfig {
     maxVideoDurationSeconds: boundedEnv("MAX_VIDEO_DURATION_SECONDS", 600, 1, 600),
     logLevel: process.env.LOG_LEVEL || "info",
     gemini: {
+      backend,
       escalationModel: process.env.GEMINI_ESCALATION_MODEL || "gemini-3.5-flash",
       escalationEnabled: booleanEnv(process.env.GEMINI_ESCALATION_ENABLED, false),
       escalationConfidenceThreshold: parseFloat(process.env.GEMINI_ESCALATION_CONFIDENCE_THRESHOLD || "0.5"),

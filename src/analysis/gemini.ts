@@ -1,11 +1,12 @@
-import { GoogleGenerativeAI, type Part, type GenerateContentResult } from "@google/generative-ai";
+import { GoogleGenerativeAI, type Part } from "@google/generative-ai";
 import { type AnalysisProvider, type AnalysisContext, type ProviderAnalysisResult } from "./provider.js";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt-builder.js";
 import { repairJson } from "./json-repair.js";
 import { ProviderError, ProviderTimeoutError } from "../utils/errors.js";
-type GeminiClient = {
+export interface GeminiGenerationResult {response:{text:()=>string;usageMetadata?:{promptTokenCount?:number;candidatesTokenCount?:number}}}
+export type GeminiClient = {
   getGenerativeModel(options: Record<string, unknown>): {
-    generateContent(request: unknown, options?: unknown): Promise<GenerateContentResult>;
+    generateContent(request: unknown, options?: unknown): Promise<GeminiGenerationResult>;
   };
 };
 export interface GeminiProviderOptions {
@@ -131,7 +132,7 @@ export class GeminiProvider implements AnalysisProvider {
     }
     throw lastError ?? new ProviderError("Gemini analysis failed");
   }
-  private async callWithTimeout(model: string, systemPrompt: string, parts: Part[], attempt: number, signal?: AbortSignal): Promise<GenerateContentResult> {
+  private async callWithTimeout(model: string, systemPrompt: string, parts: Part[], attempt: number, signal?: AbortSignal): Promise<GeminiGenerationResult> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
