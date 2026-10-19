@@ -1,10 +1,14 @@
-import { GoogleGenerativeAI, type Part, type GenerateContentResult } from "@google/generative-ai";
+import { GoogleGenerativeAI, type Part } from "@google/generative-ai";
 import { type AnalysisProvider, type AnalysisContext, type ProviderAnalysisResult } from "./provider.js";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt-builder.js";
 import { repairJson } from "./json-repair.js";
 import { ProviderError, ProviderTimeoutError } from "../utils/errors.js";
-
-type GeminiClient = { getGenerativeModel(options: Record<string, unknown>): { generateContent(request: unknown, options?: unknown): Promise<GenerateContentResult> } };
+export interface GeminiGenerationResult {response:{text:()=>string;usageMetadata?:{promptTokenCount?:number;candidatesTokenCount?:number}}}
+export type GeminiClient = {
+  getGenerativeModel(options: Record<string, unknown>): {
+    generateContent(request: unknown, options?: unknown): Promise<GeminiGenerationResult>;
+  };
+};
 export interface GeminiProviderOptions {
   client?: GeminiClient;
   escalationModel?: string;
@@ -15,21 +19,24 @@ export interface GeminiProviderOptions {
   timeoutReduceFrames?: boolean;
   retryDelayMs?: number;
 }
-
-type Parsed = Pick<ProviderAnalysisResult, "summary" | "timeline" | "detected_issues" | "hypotheses" | "recommended_actions">;
-type ModelAnalysis = { raw: string; parsed: Parsed; usage?: ProviderAnalysisResult["usage"]; attempts: number; repaired: boolean; reduced: boolean };
-
+type Parsed = Pick<ProviderAnalysisResult, "summary" | "timeline" | "detected_issues" | "hypotheses" | "recommended_actions" | "findings" | "transcript" | "output_warnings">;
+type ModelAnalysis = {
+  raw: string;
+  parsed: Parsed;
+  usage?: ProviderAnalysisResult["usage"];
+  attempts: number;
+  repaired: boolean;
+  reduced: boolean;
+};
 export class GeminiParseFailureError extends ProviderError {
   constructor(readonly analysis: Omit<ModelAnalysis, "parsed">) {
     super("Failed to parse Gemini response as JSON", { provider: "gemini" });
   }
 }
-
 export class GeminiProvider implements AnalysisProvider {
   name = "gemini";
   private client: GeminiClient;
   private options: Required<Omit<GeminiProviderOptions, "client">>;
-
   constructor(private apiKey: string, private model = "gemini-3.1-flash-lite", private maxRetries = 3, private timeoutMs = 120000, options: GeminiProviderOptions = {}) {
     this.client = options.client ?? (new GoogleGenerativeAI(apiKey) as unknown as GeminiClient);
     this.options = {
@@ -42,12 +49,13 @@ export class GeminiProvider implements AnalysisProvider {
       retryDelayMs: options.retryDelayMs ?? 1000,
     };
   }
-
   async analyze(context: AnalysisContext): Promise<ProviderAnalysisResult> {
+    context.signal?.throwIfAborted();
     let first: ModelAnalysis;
     try {
       first = await this.analyzeModel(context, this.model);
-    } catch (error) {
+    }
+    catch (error) {
       if (this.options.escalationEnabled && this.model !== this.options.escalationModel && error instanceof GeminiParseFailureError) {
         const escalated = await this.analyzeModel(context, this.options.escalationModel);
         return this.toResult(escalated, { triggered: true, from_model: this.model, to_model: this.options.escalationModel, reason: "ambiguous_response" }, error.analysis);
@@ -64,13 +72,14 @@ export class GeminiProvider implements AnalysisProvider {
       try {
         const escalated = await this.analyzeModel(context, this.options.escalationModel);
         return this.toResult(escalated, { triggered: true, from_model: this.model, to_model: this.options.escalationModel, reason }, first);
-      } catch {
+      }
+      catch {
+        context.signal?.throwIfAborted();
         return this.toResult(first, { triggered: false, reason: `escalation_failed:${reason}` });
       }
     }
     return this.toResult(first, { triggered: false });
   }
-
   private async analyzeModel(context: AnalysisContext, model: string): Promise<ModelAnalysis> {
     const systemPrompt = buildSystemPrompt();
     let frames = context.keyframes;
@@ -78,17 +87,27 @@ export class GeminiProvider implements AnalysisProvider {
     let reduced = false;
     let lastError: Error | undefined;
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      context.signal?.throwIfAborted();
       const parts: Part[] = [{ text: buildUserPrompt({ ...context, keyframes: frames }) }];
-      for (const frame of frames) if (frame.base64) parts.push({ inlineData: { mimeType: "image/jpeg", data: frame.base64 } });
+      for (const frame of frames)
+        if (frame.base64)
+          parts.push({ inlineData: { mimeType: "image/jpeg", data: frame.base64 } });
+      if (context.audio)
+        parts.push({ inlineData: { mimeType: context.audio.mimeType, data: context.audio.base64 } });
       try {
-        const result = await this.callWithTimeout(model, systemPrompt, parts, attempt);
+        context.reserveCall?.();
+        const result = await this.callWithTimeout(model, systemPrompt, parts, attempt, context.signal);
         const raw = result.response.text();
         const usageMetadata = result.response.usageMetadata;
         const usage = usageMetadata ? { input_tokens: usageMetadata.promptTokenCount ?? 0, output_tokens: usageMetadata.candidatesTokenCount ?? 0 } : undefined;
-        let parsedResult: { parsed: Parsed; repaired: boolean };
+        let parsedResult: {
+          parsed: Parsed;
+          repaired: boolean;
+        };
         try {
           parsedResult = this.parseResponse(raw);
-        } catch (error) {
+        }
+        catch (error) {
           if (error instanceof ProviderError) {
             throw new GeminiParseFailureError({ raw, usage, attempts: attempt, repaired, reduced });
           }
@@ -96,60 +115,91 @@ export class GeminiProvider implements AnalysisProvider {
         }
         repaired ||= parsedResult.repaired;
         return { raw, parsed: parsedResult.parsed, usage, attempts: attempt, repaired, reduced };
-      } catch (error) {
+      }
+      catch (error) {
+        context.signal?.throwIfAborted();
         lastError = error instanceof Error ? error : new Error(String(error));
         const parseFailure = lastError instanceof GeminiParseFailureError;
-        if (!(this.isTransient(lastError) || parseFailure) || attempt === this.maxRetries) throw lastError;
+        if (!(this.isTransient(lastError) || parseFailure) || attempt === this.maxRetries)
+          throw lastError;
         if (lastError instanceof ProviderTimeoutError && this.options.timeoutReduceFrames && frames.length > 2) {
           frames = frames.filter((_, index) => index === 0 || index === frames.length - 1 || index % 2 === 0);
           reduced = true;
         }
-        if (this.options.retryDelayMs) await new Promise((resolve) => setTimeout(resolve, Math.min(this.options.retryDelayMs * 2 ** (attempt - 1), 16000)));
+        if (this.options.retryDelayMs)
+          await new Promise((resolve) => setTimeout(resolve, Math.min(this.options.retryDelayMs * 2 ** (attempt - 1), 16000)));
       }
     }
     throw lastError ?? new ProviderError("Gemini analysis failed");
   }
-
-  private async callWithTimeout(model: string, systemPrompt: string, parts: Part[], attempt: number): Promise<GenerateContentResult> {
+  private async callWithTimeout(model: string, systemPrompt: string, parts: Part[], attempt: number, signal?: AbortSignal): Promise<GeminiGenerationResult> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      return await this.client.getGenerativeModel({ model, systemInstruction: systemPrompt, generationConfig: { responseMimeType: "application/json", temperature: 0.1, maxOutputTokens: this.options.maxOutputTokens } }).generateContent({ contents: [{ role: "user", parts }] }, { signal: controller.signal });
-    } catch (error) {
-      if (error instanceof Error && (error.name === "AbortError" || error.message.toLowerCase().includes("abort"))) throw new ProviderTimeoutError(`Gemini API call timed out after ${this.timeoutMs}ms`, { provider: this.name, model, attempt });
+      return await this.client.getGenerativeModel({ model, systemInstruction: systemPrompt, generationConfig: { responseMimeType: "application/json", temperature: 0.1, maxOutputTokens: this.options.maxOutputTokens } }).generateContent({ contents: [{ role: "user", parts }] }, { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal });
+    }
+    catch (error) {
+      if (error instanceof Error && (error.name === "AbortError" || error.message.toLowerCase().includes("abort")))
+        throw new ProviderTimeoutError(`Gemini API call timed out after ${this.timeoutMs}ms`, { provider: this.name, model, attempt });
       throw error;
-    } finally { clearTimeout(timeoutId); }
+    }
+    finally {
+      clearTimeout(timeoutId);
+    }
   }
-
-  private parseResponse(raw: string): { parsed: Parsed; repaired: boolean } {
+  private parseResponse(raw: string): {
+    parsed: Parsed;
+    repaired: boolean;
+  } {
     let parsed: Record<string, unknown> | null;
     let repaired = false;
-    try { parsed = JSON.parse(raw) as Record<string, unknown>; } catch { parsed = repairJson(raw); repaired = true; }
-    if (!parsed) throw new ProviderError("Failed to parse Gemini response as JSON", { provider: this.name });
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>;
+    }
+    catch {
+      parsed = repairJson(raw);
+      repaired = true;
+    }
+    if (!parsed)
+      throw new ProviderError("Failed to parse Gemini response as JSON", { provider: this.name });
     return { repaired, parsed: {
-      summary: typeof parsed.summary === "string" && parsed.summary ? parsed.summary : "Analysis completed but no summary was provided.",
-      timeline: Array.isArray(parsed.timeline) ? parsed.timeline as ProviderAnalysisResult["timeline"] : [],
-      detected_issues: Array.isArray(parsed.detected_issues) ? parsed.detected_issues as ProviderAnalysisResult["detected_issues"] : [],
-      hypotheses: Array.isArray(parsed.hypotheses) ? parsed.hypotheses as ProviderAnalysisResult["hypotheses"] : [],
-      recommended_actions: Array.isArray(parsed.recommended_actions) ? parsed.recommended_actions as ProviderAnalysisResult["recommended_actions"] : [],
-    } };
+        output_warnings: Array.isArray(parsed.findings) ? [] : ["structured findings missing or malformed"],
+        findings: Array.isArray(parsed.findings) ? parsed.findings : [],
+        transcript: Array.isArray(parsed.transcript) ? parsed.transcript : [],
+        summary: typeof parsed.summary === "string" && parsed.summary ? parsed.summary : "Analysis completed but no summary was provided.",
+        timeline: Array.isArray(parsed.timeline) ? parsed.timeline as ProviderAnalysisResult["timeline"] : [],
+        detected_issues: Array.isArray(parsed.detected_issues) ? parsed.detected_issues as ProviderAnalysisResult["detected_issues"] : [],
+        hypotheses: Array.isArray(parsed.hypotheses) ? parsed.hypotheses as ProviderAnalysisResult["hypotheses"] : [],
+        recommended_actions: Array.isArray(parsed.recommended_actions) ? parsed.recommended_actions as ProviderAnalysisResult["recommended_actions"] : [],
+      } };
   }
-
   private escalationReason(parsed: Parsed): string | undefined {
-    if (this.options.escalationOnCritical && parsed.detected_issues.some((issue) => issue.severity === "critical" || issue.severity === "major")) return "critical_or_major_issue";
+    if (this.options.escalationOnCritical && parsed.detected_issues.some((issue) => issue.severity === "critical" || issue.severity === "major"))
+      return "critical_or_major_issue";
     const confidences = parsed.hypotheses.map((hypothesis) => hypothesis.confidence).filter((value) => Number.isFinite(value));
-    if (confidences.length && Math.max(...confidences) < this.options.escalationConfidenceThreshold) return "low_confidence";
+    if (confidences.length && Math.max(...confidences) < this.options.escalationConfidenceThreshold)
+      return "low_confidence";
     return undefined;
   }
-
   private isTransient(error: Error): boolean {
-    if (error instanceof ProviderTimeoutError) return true;
-    const status = (error as Error & { status?: number; statusCode?: number }).status ?? (error as Error & { statusCode?: number }).statusCode;
-    if (typeof status === "number") return status === 429 || status >= 500;
+    if (error instanceof ProviderTimeoutError)
+      return true;
+    const status = (error as Error & {
+      status?: number;
+      statusCode?: number;
+    }).status ?? (error as Error & {
+      statusCode?: number;
+    }).statusCode;
+    if (typeof status === "number")
+      return status === 429 || status >= 500;
     return /network|fetch|socket|econn|rate.?limit|timeout/i.test(error.message);
   }
-
-  private toResult(result: ModelAnalysis, escalation: { triggered: boolean; from_model?: string; to_model?: string; reason?: string }, first?: Omit<ModelAnalysis, "parsed"> | ModelAnalysis): ProviderAnalysisResult {
+  private toResult(result: ModelAnalysis, escalation: {
+    triggered: boolean;
+    from_model?: string;
+    to_model?: string;
+    reason?: string;
+  }, first?: Omit<ModelAnalysis, "parsed"> | ModelAnalysis): ProviderAnalysisResult {
     const retries = first ? {
       attempts: first.attempts + result.attempts,
       json_repaired: first.repaired || result.repaired,

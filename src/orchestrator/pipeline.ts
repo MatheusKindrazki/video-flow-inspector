@@ -1,539 +1,198 @@
-import { createTempDir, TempDir } from "../utils/temp-files.js";
-import { getConfig } from "../utils/config.js";
-import { logger } from "../utils/logger.js";
-import { resolveVideoSource } from "../ingestion/validator.js";
-import {
-  extractVideoMetadata,
-  checkFfmpegAvailable,
-} from "../preprocessing/metadata.js";
-import {
-  extractKeyframes,
-  loadKeyframesAsBase64,
-  computeKeyframeChangeScores,
-} from "../preprocessing/keyframe-extractor.js";
-import { selectKeyframes, type FrameSelectionOptions } from "../preprocessing/frame-selector.js";
-import { calculateCost, type CostBreakdown, type TokenUsage } from "../analysis/pricing.js";
-import { GeminiProvider } from "../analysis/gemini.js";
-import { OpenAIProvider } from "../analysis/openai.js";
-import { AnalysisProvider, AnalysisContext } from "../analysis/provider.js";
-import { normalizeProviderOutput } from "../normalizer/semantic.js";
-import { generateRecommendation } from "../recommender/actions.js";
-import { VideoFlowError, ProviderError } from "../utils/errors.js";
-import type { AppConfig, ProviderName } from "../types/index.js";
-import type { Keyframe } from "../analysis/provider.js";
-
-export function selectFramesForAnalysis(keyframes: Keyframe[], options: FrameSelectionOptions, changeScores: number[]) {
-  return selectKeyframes(keyframes.map((keyframe, index) => ({ index: keyframe.index, timestamp_ms: keyframe.timestamp_ms, changeScore: changeScores[index] ?? 0 })), options);
+import { mkdir } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { createTempDir } from '../utils/temp-files.js';
+import { getConfig } from '../utils/config.js';
+import { resolveVideoSource } from '../ingestion/validator.js';
+import { extractVideoMetadata, checkFfmpegAvailable } from '../preprocessing/metadata.js';
+import { extractKeyframes, computeKeyframeChangeScores, loadKeyframesAsBase64 } from '../preprocessing/keyframe-extractor.js';
+import { extractAudioSegment } from '../preprocessing/audio.js';
+import { selectKeyframes, type FrameSelectionOptions } from '../preprocessing/frame-selector.js';
+import { runAnalysisWithFallback, calculateResultCost, type ProviderRunResult } from '../analysis/router.js';
+import { normalizeProviderOutput } from '../normalizer/semantic.js';
+import { generateRecommendation } from '../recommender/actions.js';
+import { validateSegmentEvidence, mergeFindings, type Finding, type Transcript } from '../analysis/evidence.js';
+import { planSegments, mapConcurrent, type Segment } from './segments.js';
+import type { AnalyzeVideoFlowInput } from '../schemas/input.js';
+import type { AnalysisContext, Keyframe } from '../analysis/provider.js';
+import type { AppConfig } from '../types/index.js';
+import { VideoFlowError } from '../utils/errors.js';
+export { calculateResultCost };
+export function selectFramesForAnalysis(keyframes: Keyframe[], options: FrameSelectionOptions, changeScores: number[]) { return selectKeyframes(keyframes.map((k, i) => ({ index: k.index, timestamp_ms: k.timestamp_ms, changeScore: changeScores[i] ?? 0 })), options); }
+export interface AnalysisRunOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: Record<string, unknown>) => void;
 }
-
-// ─── Input Type ────────────────────────────────────────────────────────────
-
-interface PipelineInput {
-  video_url?: string;
-  video_file_path?: string;
+/** Injectable I/O seams allow deterministic orchestration tests without paid calls. */
+export interface PipelineDependencies {
+  config: () => AppConfig;
+  checkMedia: typeof checkFfmpegAvailable;
+  source: typeof resolveVideoSource;
+  metadata: typeof extractVideoMetadata;
+  frames: typeof extractKeyframes;
+  audio: typeof extractAudioSegment;
+  analyze: (context: AnalysisContext, config: AppConfig) => Promise<ProviderRunResult>;
+}
+const defaults: PipelineDependencies = { config: getConfig, checkMedia: checkFfmpegAvailable, source: resolveVideoSource, metadata: extractVideoMetadata, frames: extractKeyframes, audio: extractAudioSegment, analyze: runAnalysisWithFallback };
+interface SegmentResult {
+  segment: Segment;
+  status: 'completed' | 'failed';
+  audio_status: 'analyzed' | 'absent' | 'ignored' | 'failed';
+  frames: Keyframe[];
+  candidates: number;
+  findings: Finding[];
+  transcript: Transcript[];
+  warnings: string[];
+  normalized?: ReturnType<typeof normalizeProviderOutput>;
+  provider?: ProviderRunResult;
+  duration_ms: number;
+}
+export async function analyzeVideoFlow(input: Partial<AnalyzeVideoFlowInput> & {
   goal: string;
-  app_context?: string;
-  expected_flow?: string[];
-  environment?: string;
-  instructions?: string;
-}
-
-// ─── Output Type ───────────────────────────────────────────────────────────
-
-interface PipelineOutput {
-  summary: string;
-  timeline: Array<{
-    timestamp_ms: number;
-    frame_index: number;
-    action: string;
-    element?: string;
-    description: string;
-    screenshot_index?: number;
-    status: "normal" | "warning" | "error";
-  }>;
-  detected_issues: Array<{
-    id: string;
-    severity: "critical" | "major" | "minor" | "info";
-    type: string;
-    title: string;
-    description: string;
-    timestamp_ms?: number;
-    frame_index?: number;
-    expected_behavior?: string;
-    actual_behavior: string;
-    evidence: string;
-  }>;
-  hypotheses: Array<{
-    id: string;
-    description: string;
-    confidence: number;
-    supporting_evidence: string[];
-    suggested_investigation: string;
-  }>;
-  recommended_actions: Array<{
-    id: string;
-    priority: number;
-    action: string;
-    rationale: string;
-    type: "investigate" | "fix" | "test" | "monitor" | "escalate";
-    estimated_effort?: string;
-  }>;
-  next_best_action: {
-    id: string;
-    priority: number;
-    action: string;
-    rationale: string;
-    type: string;
-    estimated_effort?: string;
-  };
-  confidence: number;
-  metadata: {
-    provider: string;
-    model: string;
-    video_duration_ms: number;
-    keyframes_analyzed: number;
-    analysis_duration_ms: number;
-    cost_estimate_usd?: number;
-    frames?: { candidates: number; analyzed: number; discarded: number; selection_strategy: string };
-    usage?: { input_tokens: number; output_tokens: number };
-    cost?: { input_cost_usd: number; output_cost_usd: number; total_cost_usd: number; pricing_source: "confirmed" | "heuristic" };
-    escalation?: { triggered: boolean; from_model?: string; to_model?: string; reason?: string; from_usage?: TokenUsage };
-    retries?: { attempts: number; json_repaired: boolean; frames_reduced: boolean };
-  };
-  raw_provider_notes?: string;
-}
-
-// ─── Provider Factory ──────────────────────────────────────────────────────
-
-/**
- * Create an analysis provider by name.
- * Returns null if the API key is not configured for that provider.
- */
-function createProvider(
-  name: ProviderName,
-  config: AppConfig,
-): AnalysisProvider | null {
-  const providerConfig = config.providers[name];
-
-  if (!providerConfig || !providerConfig.apiKey) {
-    logger.debug(`Provider "${name}" has no API key configured, skipping`, {
-      provider: name,
-    });
-    return null;
-  }
-
-  switch (name) {
-    case "gemini":
-      return new GeminiProvider(
-        providerConfig.apiKey,
-        providerConfig.model,
-        providerConfig.maxRetries,
-        providerConfig.timeoutMs,
-        {
-          escalationModel: config.gemini.escalationModel,
-          escalationEnabled: config.gemini.escalationEnabled,
-          escalationConfidenceThreshold: config.gemini.escalationConfidenceThreshold,
-          escalationOnCritical: config.gemini.escalationOnCritical,
-          maxOutputTokens: config.gemini.maxOutputTokens,
-          timeoutReduceFrames: config.gemini.timeoutReduceFrames,
-        },
-      );
-
-    case "openai":
-      return new OpenAIProvider(
-        providerConfig.apiKey,
-        providerConfig.model,
-        providerConfig.maxRetries,
-        providerConfig.timeoutMs,
-      );
-
-    case "anthropic":
-      // Anthropic provider not yet implemented
-      logger.warn("Anthropic provider is not yet implemented", {
-        provider: name,
-      });
-      return null;
-
-    default:
-      logger.warn(`Unknown provider: "${name}"`, { provider: name });
-      return null;
-  }
-}
-
-// ─── Main Pipeline ─────────────────────────────────────────────────────────
-
-/**
- * Execute the full analysis pipeline.
- *
- * Steps:
- * 1. Check ffmpeg availability
- * 2. Create temp directory
- * 3. Resolve video source (download if URL)
- * 4. Extract video metadata
- * 5. Extract keyframes
- * 6. Load keyframes as base64
- * 7. Create provider (primary or fallback)
- * 8. Run analysis
- * 9. Normalize output
- * 10. Generate recommendation
- * 11. Assemble final output
- * 12. Cleanup temp dir
- *
- * If primary provider fails, try fallback provider.
- * Always cleanup temp dir, even on error.
- */
-export async function analyzeVideoFlow(
-  input: PipelineInput,
-): Promise<PipelineOutput> {
-  const startTime = Date.now();
-  let tempDir: TempDir | null = null;
-
+}, options: AnalysisRunOptions = {}, dependencies: Partial<PipelineDependencies> = {}) {
+  const d = { ...defaults, ...dependencies };
+  const config = d.config();
+  const started = Date.now();
+  const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(config.session.deadlineMs)]) : AbortSignal.timeout(config.session.deadlineMs);
+  signal.throwIfAborted();
+  if (!await d.checkMedia(signal))
+    throw new VideoFlowError('Install ffmpeg and ffprobe before analyzing media', 'FFMPEG_NOT_FOUND');
+  const temporary = await createTempDir('video-flow-');
+  let calls = 0;
+  let completed = 0;
+  const progress = (phase: string, extra: Record<string, unknown> = {}) => { options.onProgress?.({ phase, elapsed_ms: Date.now() - started, provider_calls: calls, ...extra }); };
   try {
-    // ── Step 1: Check ffmpeg ──────────────────────────────────────────
-    logger.info("Pipeline started", { goal: input.goal });
-
-    const ffmpegAvailable = await checkFfmpegAvailable();
-    if (!ffmpegAvailable) {
-      throw new VideoFlowError(
-        "ffmpeg/ffprobe is not installed or not found on PATH. Please install ffmpeg and try again.",
-        "FFMPEG_NOT_FOUND",
-      );
+    progress('ingestion');
+    const source = await d.source(input, temporary.path, config.maxVideoSizeMB, signal);
+    const metadata = await d.metadata(source.filePath, signal);
+    if (!Number.isFinite(metadata.duration_ms) || metadata.duration_ms <= 0 || metadata.duration_ms > config.maxVideoDurationSeconds * 1000)
+      throw new VideoFlowError('Video duration must be positive and within the configured limit (at most 600 seconds)', 'VIDEO_TOO_LONG');
+    const audioMode = input.audio_mode ?? 'auto';
+    const useAudio = metadata.has_audio && audioMode !== 'ignore';
+    if (audioMode === 'required' && !metadata.has_audio)
+      throw new VideoFlowError('This recording has no audio stream', 'AUDIO_REQUIRED');
+    if (useAudio && !(['gemini'] as const).some(name => config.providers[name] && (config.defaultProvider === name || config.fallbackProvider === name)))
+      throw new VideoFlowError('Audio analysis requires Gemini as configured primary or fallback. Set audio_mode=ignore only if you explicitly want visual-only analysis', 'AUDIO_PROVIDER_UNAVAILABLE');
+    const hash = createHash('sha256');
+    for await (const bytes of createReadStream(source.filePath)) {
+      signal.throwIfAborted();
+      hash.update(bytes);
     }
-
-    // ── Step 2: Create temp directory ─────────────────────────────────
-    tempDir = await createTempDir("video-flow-");
-    logger.debug("Temp directory created", { path: tempDir.path });
-
-    // ── Step 3: Load config ───────────────────────────────────────────
-    const config = getConfig();
-
-    // ── Step 4: Resolve video source ──────────────────────────────────
-    const videoSource = await resolveVideoSource(
-      {
-        video_url: input.video_url,
-        video_file_path: input.video_file_path,
-      },
-      tempDir.path,
-      config.maxVideoSizeMB,
-    );
-
-    logger.info("Video source resolved", {
-      filePath: videoSource.filePath,
-      sizeBytes: videoSource.sizeBytes,
-      wasDownloaded: videoSource.wasDownloaded,
-    });
-
-    // ── Step 5: Extract video metadata ────────────────────────────────
-    const metadata = await extractVideoMetadata(videoSource.filePath);
-
-    logger.info("Video metadata extracted", {
-      duration_ms: metadata.duration_ms,
-      width: metadata.width,
-      height: metadata.height,
-      fps: metadata.fps,
-      codec: metadata.codec,
-    });
-
-    // Check video duration limit
-    const maxDurationMs = config.maxVideoDurationSeconds * 1000;
-    if (metadata.duration_ms > maxDurationMs) {
-      throw new VideoFlowError(
-        `Video duration (${(metadata.duration_ms / 1000).toFixed(1)}s) exceeds maximum allowed (${config.maxVideoDurationSeconds}s)`,
-        "VIDEO_TOO_LONG",
-        {
-          duration_ms: metadata.duration_ms,
-          max_duration_ms: maxDurationMs,
-        },
-      );
-    }
-
-    // ── Step 6: Extract keyframes ─────────────────────────────────────
-    const keyframeOutputDir = tempDir.filePath("keyframes");
-    // Create keyframes subdirectory
-    const { mkdir } = await import("node:fs/promises");
-    await mkdir(keyframeOutputDir, { recursive: true });
-
-    const keyframes = await extractKeyframes(
-      videoSource.filePath,
-      metadata.duration_ms,
-      {
-        intervalSeconds: Math.max(0.5, config.keyframeIntervalSeconds / 2),
-        maxFrames: config.maxKeyframes * 2,
-        outputDir: keyframeOutputDir,
-      },
-    );
-
-    const changeScores = await computeKeyframeChangeScores(keyframes);
-    const selection = selectFramesForAnalysis(keyframes, {
-      maxFrames: config.maxKeyframes,
-      changeThreshold: config.frameSelection.changeThreshold,
-      safetyIntervalMs: config.frameSelection.safetyIntervalMs,
-      minFrames: 2,
-    }, changeScores);
-    const selectedIndexes = new Set(selection.selected.map((frame) => frame.index));
-    const selectedKeyframes = keyframes.filter((frame) => selectedIndexes.has(frame.index));
-    const discardedKeyframes = keyframes.filter((frame) => !selectedIndexes.has(frame.index));
-    const { unlink } = await import("node:fs/promises");
-    await Promise.all(discardedKeyframes.map(async (frame) => unlink(frame.path).catch(() => undefined)));
-
-    logger.info("Keyframes adaptively selected", { candidates: keyframes.length, selected: selectedKeyframes.length, discarded: discardedKeyframes.length, strategy: selection.strategy });
-
-    // ── Step 7: Load keyframes as base64 ──────────────────────────────
-    const keyframesWithBase64 = await loadKeyframesAsBase64(selectedKeyframes);
-
-    logger.info("Keyframes loaded as base64", {
-      count: keyframesWithBase64.length,
-    });
-
-    // ── Step 8: Create provider and run analysis ──────────────────────
-    const analysisContext: AnalysisContext = {
-      goal: input.goal,
-      app_context: input.app_context,
-      expected_flow: input.expected_flow,
-      environment: input.environment,
-      instructions: input.instructions,
-      keyframes: keyframesWithBase64,
-      video_duration_ms: metadata.duration_ms,
+    const sourceHash = hash.digest('hex');
+    const segments = planSegments(metadata.duration_ms, config.session.segmentSeconds * 1000, config.session.overlapSeconds * 1000);
+    progress('analysis', { segments_total: segments.length, segments_completed: 0 });
+    const reserveCall = () => { signal.throwIfAborted(); if (calls >= config.session.maxProviderCalls)
+      throw new Error('PROVIDER_CALL_BUDGET_EXCEEDED'); calls++; };
+    const runSegment = async (segment: Segment, refinement = false): Promise<SegmentResult> => {
+      const begin = Date.now();
+      const folder = temporary.filePath(segment.id);
+      await mkdir(folder, { recursive: true });
+      const base: SegmentResult = { segment, status: 'failed', audio_status: useAudio ? 'failed' : metadata.has_audio ? 'ignored' : 'absent', frames: [], candidates: 0, findings: [], transcript: [], warnings: [], duration_ms: 0 };
+      try {
+        signal.throwIfAborted();
+        const parts = await Promise.allSettled([
+          d.frames(source.filePath, segment.end_ms - segment.start_ms, { intervalSeconds: refinement ? .15 : Math.max(.25,config.keyframeIntervalSeconds/4), maxFrames: config.maxKeyframes * 8, outputDir: folder, startMs: segment.start_ms, width: Math.min(metadata.width, refinement ? 1600 : 800), signal }),
+          useAudio ? d.audio(source.filePath, segment, `${folder}/audio.mp3`, signal) : Promise.resolve(undefined),
+        ]);
+        signal.throwIfAborted();
+        if (parts[0].status === 'rejected')
+          throw new Error('FRAME_EXTRACTION_FAILED');
+        const candidates = parts[0].value;
+        const scores = await computeKeyframeChangeScores(candidates);
+        const selection = selectFramesForAnalysis(candidates, { maxFrames: config.maxKeyframes, changeThreshold: config.frameSelection.changeThreshold, safetyIntervalMs: refinement ? 200 : config.frameSelection.safetyIntervalMs, minFrames: Math.min(4, config.maxKeyframes) }, scores);
+        const chosen = new Set(selection.selected.map(f => f.index));
+        // Each segment has a stable disjoint frame-index range, including refinement segments.
+        const segmentNumber = Number(segment.id.slice(1)) + (refinement ? 1000 : 0);
+        const frames = await loadKeyframesAsBase64(candidates.filter(f => chosen.has(f.index)).map(f => ({ ...f, index: segmentNumber * 10000 + f.index })));
+        base.frames = frames;
+        base.candidates = candidates.length;
+        let audio = parts[1].status === 'fulfilled' ? parts[1].value : undefined;
+        if (parts[1].status === 'rejected') {
+          if (audioMode === 'required')
+            throw new Error('AUDIO_EXTRACTION_FAILED');
+          base.warnings.push(`${segment.id}: audio extraction failed; segment analyzed visually only`);
+        }
+        base.audio_status = audio ? 'analyzed' : base.audio_status;
+        const context: AnalysisContext = { ...input, analysis_mode: input.analysis_mode ?? 'combined', keyframes: frames, video_duration_ms: metadata.duration_ms, segment, audio, signal, reserveCall };
+        const provider = await d.analyze(context, config);
+        base.provider = provider;
+        const evidence = validateSegmentEvidence(provider.result, { segment, keyframes: frames, hasAudio: !!audio });
+        base.findings = evidence.findings.filter(f => (input.analysis_mode ?? 'combined') === 'combined' || f.category === input.analysis_mode);
+        base.transcript = evidence.transcript;
+        base.warnings.push(...evidence.warnings, ...(provider.result.output_warnings ?? []).map(w => `${segment.id}: ${w}`));
+        if (provider.result.detected_issues.length && !base.findings.length)
+          base.warnings.push(`${segment.id}: legacy issues could not be promoted to evidence-validated findings`);
+        if (audio && !evidence.transcript.length)
+          base.warnings.push(`${segment.id}: no intelligible speech returned; speech recognition completeness is unverified`);
+        if (!provider.result.findings)
+          base.warnings.push(`${segment.id}: provider omitted structured findings; legacy issues are not evidence-verified findings`);
+        const normalized = normalizeProviderOutput(provider.result);
+        const originalTimeline = normalized.timeline.length;
+        normalized.timeline = normalized.timeline.filter(event => Number.isInteger(event.frame_index) && frames.some(f => f.index === event.frame_index && Math.abs(f.timestamp_ms - event.timestamp_ms) <= 2000));
+        if (normalized.timeline.length !== originalTimeline)
+          base.warnings.push(`${segment.id}: unsupported timeline references discarded`);
+        const dropped = (provider.result.timeline.length + provider.result.detected_issues.length + provider.result.hypotheses.length + provider.result.recommended_actions.length) - (normalized.timeline.length + normalized.detected_issues.length + normalized.hypotheses.length + normalized.recommended_actions.length);
+        if (dropped > 0)
+          base.warnings.push(`${segment.id}: ${dropped} provider entries failed normalization or evidence checks`);
+        base.normalized = normalized;
+        base.status = 'completed';
+      }
+      catch (error) {
+        signal.throwIfAborted();
+        if (error instanceof Error && error.message === "PROVIDER_CALL_BUDGET_EXCEEDED")
+          base.warnings.push(`${segment.id}: provider call budget exhausted`);
+        base.warnings.push(`${segment.id}: segment failed; no conclusion is available for this interval`);
+      }
+      base.duration_ms = Date.now() - begin;
+      completed++;
+      progress(refinement ? 'refinement' : 'analysis', { segments_total: segments.length, segments_completed: Math.min(completed, segments.length), last_segment: segment.id, last_segment_status: base.status, partial_findings: base.findings.length });
+      return base;
     };
-
-    let providerResult = await runAnalysisWithFallback(
-      analysisContext,
-      config,
-    );
-
-    // ── Step 9: Normalize output ──────────────────────────────────────
-    const normalized = normalizeProviderOutput({
-      summary: providerResult.result.summary,
-      timeline: providerResult.result.timeline,
-      detected_issues: providerResult.result.detected_issues,
-      hypotheses: providerResult.result.hypotheses,
-      recommended_actions: providerResult.result.recommended_actions,
-    });
-
-    // ── Step 10: Generate recommendation ──────────────────────────────
-    const recommendation = generateRecommendation(normalized);
-
-    // ── Step 11: Assemble final output ────────────────────────────────
-    const analysisDurationMs = Date.now() - startTime;
-    const { cost, usage } = calculateResultCost(providerResult.model, providerResult.result);
-
-    const output: PipelineOutput = {
-      summary: normalized.summary,
-      timeline: normalized.timeline,
-      detected_issues: normalized.detected_issues,
-      hypotheses: normalized.hypotheses,
-      recommended_actions: normalized.recommended_actions,
-      next_best_action: recommendation.next_best_action,
-      confidence: recommendation.confidence,
-      metadata: {
-        provider: providerResult.providerName,
-        model: providerResult.model,
-        video_duration_ms: metadata.duration_ms,
-        keyframes_analyzed: keyframesWithBase64.length,
-        analysis_duration_ms: analysisDurationMs,
-        frames: { candidates: keyframes.length, analyzed: keyframesWithBase64.length, discarded: discardedKeyframes.length, selection_strategy: selection.strategy },
-        usage,
-        cost,
-        escalation: providerResult.result.meta?.escalation ?? { triggered: false },
-        retries: providerResult.result.meta?.retries ?? { attempts: 1, json_repaired: false, frames_reduced: false },
-        cost_estimate_usd: cost.total_cost_usd,
-      },
-      raw_provider_notes: providerResult.result.raw,
+    const results = await mapConcurrent(segments, config.session.concurrency, segment => runSegment(segment), signal);
+    if (results.every(r => r.status === 'failed'))
+      throw new VideoFlowError('All segments failed. Check media extraction, provider model access, and audio capability', 'ANALYSIS_FAILED');
+    const initialFindings = mergeFindings(results.flatMap(r => r.findings));
+    const refineTargets = initialFindings.filter(f => f.basis === 'hypothesis' || f.severity === 'critical' || f.severity === 'major').filter((f, i, a) => a.findIndex(x => Math.abs(x.timestamp_ms - f.timestamp_ms) < 5000) === i).slice(0, config.session.maxRefinements);
+    const refinements = refineTargets.map((f, i) => ({ id: `R${i + 1}`, start_ms: Math.max(0, f.timestamp_ms - 2500), end_ms: Math.min(metadata.duration_ms, f.timestamp_ms + 2500) }));
+    if (calls < config.session.maxProviderCalls)
+      results.push(...await mapConcurrent(refinements, config.session.concurrency, s => runSegment(s, true), signal));
+    const findings = mergeFindings(results.flatMap(r => r.findings));
+    const warnings = [...new Set(results.flatMap(r => r.warnings))];
+    const timeline = results.flatMap(r => r.normalized?.timeline ?? []).sort((a, b) => a.timestamp_ms - b.timestamp_ms).filter((e, i, a) => !a.slice(0, i).some(p => p.action === e.action && p.description === e.description && Math.abs(p.timestamp_ms - e.timestamp_ms) < 2000));
+    const issues = findings.filter(f => f.category === 'bug' && f.basis !== 'hypothesis').map(f => ({ id: f.id, severity: f.severity, type: 'unknown' as const, title: f.title, description: f.description, timestamp_ms: f.timestamp_ms, frame_index: f.evidence_refs.find(r => r.kind === 'frame')?.frame_index, actual_behavior: f.description, evidence: JSON.stringify(f.evidence_refs) }));
+    const hypotheses = findings.filter(f => f.basis === 'hypothesis').map(f => ({ id: f.id, description: f.description, confidence: 0, supporting_evidence: f.evidence_refs.map(r => JSON.stringify(r)), suggested_investigation: f.recommendation, status: 'unverified' as const, confidence_status: 'not_calibrated' as const }));
+    const actions = findings.map((f, i) => ({ id: `ACTION-${i + 1}`, priority: i + 1, action: f.recommendation, rationale: `${f.title}. Evidence: ${JSON.stringify(f.evidence_refs)}`, type: 'investigate' as const, finding_id: f.id }));
+    const summary = `${results.filter(r => r.status === 'completed' && r.segment.id.startsWith('S')).length}/${segments.length} recording segments analyzed. ${findings.length} evidence-linked findings (${findings.filter(f => f.category === 'bug').length} bug, ${findings.filter(f => f.category === 'usability').length} usability). ${findings.slice(0, 3).map(f => f.title).join('; ')}${warnings.length ? ' Analysis limitations are listed in quality.warnings.' : ''}`;
+    const legacy = generateRecommendation({ summary, timeline, detected_issues: issues, hypotheses, recommended_actions: actions });
+    if (!actions.length)
+      actions.push({ ...legacy.next_best_action, type: 'investigate', finding_id: '' });
+    const costs = results.filter(r => r.provider).map(r => ({ segment_id: r.segment.id, provider: r.provider!.providerName, model: r.provider!.model, ...calculateResultCost(r.provider!.model, r.provider!.result), retries: r.provider!.result.meta?.retries, escalation: r.provider!.result.meta?.escalation }));
+    const totalCost = costs.reduce((n, c) => n + c.cost.total_cost_usd, 0);
+    const allFrames = results.flatMap(r => r.frames.map(f => ({ index: f.index, timestamp_ms: f.timestamp_ms, segment_id: r.segment.id, width: f.width, height: f.height })));
+    const sortedTimes = [...new Set(results.filter(r => r.segment.id.startsWith('S')).flatMap(r => r.frames.map(f => f.timestamp_ms)))].sort((a, b) => a - b);
+    const gaps = [sortedTimes[0] ?? metadata.duration_ms, ...sortedTimes.slice(1).map((t, i) => t - sortedTimes[i]), metadata.duration_ms - (sortedTimes.at(-1) ?? 0)];
+    progress('completed', { segments_total: segments.length, segments_completed: results.filter(r => r.segment.id.startsWith('S') && r.status === 'completed').length, findings: findings.length });
+    return { summary, timeline, detected_issues: issues, hypotheses, recommended_actions: actions, next_best_action: actions[0], confidence: legacy.confidence,
+      findings, transcript: results.flatMap(r => r.transcript).sort((a, b) => a.start_ms - b.start_ms),
+      segment_summaries: results.map(r => ({ segment: r.segment, status: r.status, audio_status: r.audio_status, summary: r.normalized?.summary ?? null })),
+      evidence_catalog: { source_sha256: sourceHash, frames: allFrames },
+      quality: { complete: results.every(r => r.status === 'completed') && !results.some(r => r.audio_status === 'failed') && warnings.length === 0, warnings, confidence_status: 'not_calibrated', limitations: ['Screen states are sampled, not continuous click/DOM/backend telemetry.', 'Transcript is model-generated, not human-verified.', 'No findings does not establish absence of problems.', 'Legacy numeric confidence and hypothesis confidence are not calibrated probabilities.', 'Global task completion and root causes require independent verification.'] },
+      metadata: { provider: [...new Set(costs.map(c => c.provider))].join(','), model: [...new Set(costs.map(c => c.model))].join(','), video_duration_ms: metadata.duration_ms, keyframes_analyzed: allFrames.length, analysis_duration_ms: Date.now() - started, cost_estimate_usd: totalCost,
+        frames: { candidates: results.reduce((n, r) => n + r.candidates, 0), analyzed: allFrames.length, discarded: results.reduce((n, r) => n + r.candidates - r.frames.length, 0), selection_strategy: 'balanced-segmented-pixel-difference', max_sample_gap_ms: Math.max(...gaps) },
+        usage: costs.every(c => c.usage) ? { input_tokens: costs.reduce((n, c) => n + c.usage!.input_tokens, 0), output_tokens: costs.reduce((n, c) => n + c.usage!.output_tokens, 0) } : undefined,
+        cost: { total_cost_usd: totalCost, pricing_source: useAudio ? 'heuristic' : costs.every(c => c.cost.pricing_source === 'confirmed') ? 'confirmed' : 'heuristic', scope: 'successful provider results only; failed attempts may incur additional cost; configured rates are not live-verified' },
+        segments: segments.length, refinements: results.filter(r => r.segment.id.startsWith('R')).length, provider_calls: calls, max_provider_calls: config.session.maxProviderCalls, provider_runs: costs, audio: { source_has_audio: metadata.has_audio, mode: audioMode, analyzed_segments: results.filter(r => r.audio_status === 'analyzed').length }, gemini_backend:config.gemini.backend, confidence_method: 'legacy_uncalibrated_heuristic_not_probability' },
     };
-
-    logger.info("Pipeline completed successfully", {
-      duration_ms: analysisDurationMs,
-      provider: providerResult.providerName,
-      issues_found: normalized.detected_issues.length,
-      confidence: recommendation.confidence,
-    });
-
-    return output;
-  } catch (error) {
-    const analysisDurationMs = Date.now() - startTime;
-
-    if (error instanceof VideoFlowError) {
-      logger.error("Pipeline failed with known error", {
-        code: error.code,
-        message: error.message,
-        details: error.details,
-        duration_ms: analysisDurationMs,
-      });
+  }
+  catch (error) {
+    if (signal.aborted)
+      throw new VideoFlowError(options.signal?.aborted ? 'Analysis cancelled' : 'Analysis deadline exceeded', options.signal?.aborted ? 'ANALYSIS_CANCELLED' : 'ANALYSIS_TIMEOUT');
+    if (error instanceof VideoFlowError)
       throw error;
-    }
-
-    const message =
-      error instanceof Error ? error.message : String(error);
-
-    logger.error("Pipeline failed with unexpected error", {
-      error: message,
-      duration_ms: analysisDurationMs,
-    });
-
-    throw new VideoFlowError(
-      `Pipeline failed: ${message}`,
-      "PIPELINE_ERROR",
-      {
-        original_error: message,
-        duration_ms: analysisDurationMs,
-      },
-    );
-  } finally {
-    // ── Step 12: Cleanup ──────────────────────────────────────────────
-    if (tempDir) {
-      try {
-        await tempDir.cleanup();
-        logger.debug("Temp directory cleaned up");
-      } catch (cleanupError) {
-        logger.warn("Failed to cleanup temp directory", {
-          error: String(cleanupError),
-          path: tempDir.path,
-        });
-      }
-    }
+    throw new VideoFlowError('Analysis failed; check source access, ffmpeg and provider configuration', 'PIPELINE_ERROR');
+  }
+  finally {
+    await temporary.cleanup();
   }
 }
-
-// ─── Analysis with Fallback ────────────────────────────────────────────────
-
-interface ProviderRunResult {
-  providerName: string;
-  model: string;
-  result: {
-    raw: string;
-    summary: string;
-    timeline: unknown[];
-    detected_issues: unknown[];
-    hypotheses: unknown[];
-    recommended_actions: unknown[];
-    usage?: {
-      input_tokens: number;
-      output_tokens: number;
-    };
-    meta?: {
-      retries: { attempts: number; json_repaired: boolean; frames_reduced: boolean };
-      escalation: { triggered: boolean; from_model?: string; to_model?: string; reason?: string; from_usage?: TokenUsage };
-    };
-  };
-}
-
-export function calculateResultCost(model: string, result: Pick<ProviderRunResult["result"], "usage" | "meta">): { cost: CostBreakdown; usage?: TokenUsage } {
-  const escalated = result.meta?.escalation;
-  const currentCost = calculateCost(model, result.usage);
-  if (!escalated?.triggered || !escalated.from_model || !escalated.from_usage) return { cost: currentCost, usage: result.usage };
-
-  const firstCost = calculateCost(escalated.from_model, escalated.from_usage);
-  const round = (value: number) => Math.round(value * 1_000_000_000) / 1_000_000_000;
-  return {
-    // Aggregate initial + final token usage so it stays coherent with the
-    // combined cost. Only return summed usage when the final (escalation) usage
-    // is actually present; otherwise omit usage rather than inventing tokens.
-    usage: result.usage ? {
-      input_tokens: escalated.from_usage.input_tokens + result.usage.input_tokens,
-      output_tokens: escalated.from_usage.output_tokens + result.usage.output_tokens,
-    } : undefined,
-    cost: {
-      input_tokens: firstCost.input_tokens + currentCost.input_tokens,
-      output_tokens: firstCost.output_tokens + currentCost.output_tokens,
-      input_cost_usd: round(firstCost.input_cost_usd + currentCost.input_cost_usd),
-      output_cost_usd: round(firstCost.output_cost_usd + currentCost.output_cost_usd),
-      total_cost_usd: round(firstCost.total_cost_usd + currentCost.total_cost_usd),
-      pricing_source: firstCost.pricing_source === "confirmed" && currentCost.pricing_source === "confirmed" ? "confirmed" : "heuristic",
-    },
-  };
-}
-
-/**
- * Run analysis with primary provider, falling back to the fallback provider
- * if the primary fails.
- */
-async function runAnalysisWithFallback(
-  context: AnalysisContext,
-  config: AppConfig,
-): Promise<ProviderRunResult> {
-  // Try primary provider
-  const primaryProvider = createProvider(config.defaultProvider, config);
-  const primaryConfig = config.providers[config.defaultProvider];
-
-  if (primaryProvider && primaryConfig) {
-    try {
-      logger.info("Running analysis with primary provider", {
-        provider: config.defaultProvider,
-        model: primaryConfig.model,
-      });
-
-      const result = await primaryProvider.analyze(context);
-
-      return {
-        providerName: config.defaultProvider,
-        model: result.meta?.escalation.to_model ?? primaryConfig.model,
-        result,
-      };
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : String(error);
-
-      logger.warn("Primary provider failed, attempting fallback", {
-        primary_provider: config.defaultProvider,
-        fallback_provider: config.fallbackProvider,
-        error: message,
-      });
-    }
-  } else {
-    logger.warn("Primary provider not available, attempting fallback", {
-      primary_provider: config.defaultProvider,
-      fallback_provider: config.fallbackProvider,
-    });
-  }
-
-  // Try fallback provider (only if different from primary)
-  if (config.fallbackProvider !== config.defaultProvider) {
-    const fallbackProvider = createProvider(config.fallbackProvider, config);
-    const fallbackConfig = config.providers[config.fallbackProvider];
-
-    if (fallbackProvider && fallbackConfig) {
-      try {
-        logger.info("Running analysis with fallback provider", {
-          provider: config.fallbackProvider,
-          model: fallbackConfig.model,
-        });
-
-        const result = await fallbackProvider.analyze(context);
-
-        return {
-          providerName: config.fallbackProvider,
-          model: result.meta?.escalation.to_model ?? fallbackConfig.model,
-          result,
-        };
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : String(error);
-
-        logger.error("Fallback provider also failed", {
-          fallback_provider: config.fallbackProvider,
-          error: message,
-        });
-
-        throw new ProviderError(
-          `Both primary (${config.defaultProvider}) and fallback (${config.fallbackProvider}) providers failed. Last error: ${message}`,
-          {
-            primary_provider: config.defaultProvider,
-            fallback_provider: config.fallbackProvider,
-          },
-        );
-      }
-    }
-  }
-
-  // No providers available at all
-  throw new ProviderError(
-    "No analysis provider available. Ensure at least one provider API key is configured.",
-    {
-      default_provider: config.defaultProvider,
-      fallback_provider: config.fallbackProvider,
-      configured_providers: Object.entries(config.providers)
-        .filter(([, cfg]) => cfg !== undefined)
-        .map(([name]) => name),
-    },
-  );
-}
+export type PipelineOutput = Awaited<ReturnType<typeof analyzeVideoFlow>>;
